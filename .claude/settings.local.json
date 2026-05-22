@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv --version)",
+      "PowerShell(Get-Command *)",
+      "PowerShell(uv *)",
+      "PowerShell(conda create *)",
+      "PowerShell(conda run *)",
+      "Bash(curl -sf http://127.0.0.1:8787/health)",
+      "Bash(curl -s http://127.0.0.1:8787/health)",
+      "PowerShell(Get-NetTCPConnection *)",
+      "Bash(netstat -ano)",
+      "PowerShell(Get-Process *)",
+      "Bash(curl -sf http://127.0.0.1:8765/health)",
+      "Bash(curl -s http://127.0.0.1:8765/health)",
+      "Bash(curl -s http://127.0.0.1:8765/openapi.json)",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('title:',d['info']['title']\\); print\\('paths:',list\\(d['paths'].keys\\(\\)\\)\\)\")",
+      "Bash(curl *)",
+      "Bash(set -e)",
+      "PowerShell(if \\(Test-Path C:\\\\Users\\\\alex_\\\\mygems\\\\Conduit\\\\run.ps1\\) { Write-Host \"wrote run.ps1 \\(\" \\(Get-Item C:\\\\Users\\\\alex_\\\\mygems\\\\Conduit\\\\run.ps1\\).Length \"bytes\\)\" })"
+    ]
+  }
+}

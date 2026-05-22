@@ -1,0 +1,1 @@
+conda run -n conduit --no-capture-output python scripts/inference_demo.py
