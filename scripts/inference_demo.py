@@ -10,9 +10,9 @@ strongest possible compatibility test: if this script works, any Anthropic
 SDK client works.
 
 Usage:
-    conda run -n conduit python scripts/inference_demo.py
-    conda run -n conduit python scripts/inference_demo.py --url http://127.0.0.1:9000
-    conda run -n conduit python scripts/inference_demo.py --model claude-sonnet-4-6
+    conda run -n conduit --no-capture-output python scripts/inference_demo.py
+    conda run -n conduit --no-capture-output python scripts/inference_demo.py --url http://127.0.0.1:9000
+    conda run -n conduit --no-capture-output python scripts/inference_demo.py --model claude-sonnet-4-6
 """
 from __future__ import annotations
 

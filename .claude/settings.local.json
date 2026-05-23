@@ -18,7 +18,10 @@
       "Bash(curl *)",
       "Bash(set -e)",
       "PowerShell(if \\(Test-Path C:\\\\Users\\\\alex_\\\\mygems\\\\Conduit\\\\run.ps1\\) { Write-Host \"wrote run.ps1 \\(\" \\(Get-Item C:\\\\Users\\\\alex_\\\\mygems\\\\Conduit\\\\run.ps1\\).Length \"bytes\\)\" })",
-      "Bash(git check-ignore *)"
+      "Bash(git check-ignore *)",
+      "Bash(python -c \"import sys,json; m=json.load\\(sys.stdin\\); print\\('stop_reason:', m['stop_reason']\\); print\\('blocks:'\\); [print\\(f'  [{i}] {b[\\\\\"type\\\\\"]}' + \\(f' name={b.get\\(\\\\\"name\\\\\"\\)!r} input={b.get\\(\\\\\"input\\\\\"\\)!r}' if b['type']=='server_tool_use' else f' tool_use_id={b.get\\(\\\\\"tool_use_id\\\\\"\\)!r} content_len={len\\(str\\(b.get\\(\\\\\"content\\\\\",\\\\\"\\\\\"\\)\\)\\)}' if 'tool_result' in b['type'] else f' text={b.get\\(\\\\\"text\\\\\",\\\\\"\\\\\"\\)[:80]!r}'\\)\\) for i,b in enumerate\\(m['content']\\)]\")",
+      "Bash(python -c \"import sys,json; m=json.load\\(sys.stdin\\); print\\('stop:',m['stop_reason']\\); print\\('blocks:',[b['type'] for b in m['content']]\\)\")",
+      "Bash(python -c 'import sys,json; m=json.load\\(sys.stdin\\); print\\('\\\\''stop:'\\\\'',m['\\\\''stop_reason'\\\\'']\\); print\\('\\\\''blocks:'\\\\'',[b['\\\\''type'\\\\''] for b in m['\\\\''content'\\\\'']]\\); *)"
     ]
   }
 }

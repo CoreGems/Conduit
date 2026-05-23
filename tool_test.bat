@@ -1,0 +1,1 @@
+conda run -n conduit --no-capture-output python scripts/tool_demo.py

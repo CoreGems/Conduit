@@ -27,6 +27,7 @@ from conduit.streaming import (
     stream_anthropic_events,
     stream_tool_events,
 )
+from conduit.tool_bridge import split_tools
 
 router = APIRouter(prefix="/v1", tags=["messages"])
 
@@ -126,7 +127,9 @@ async def _collect_tool_message(session, user_text, model) -> dict:
         elif t == "content_block_start":
             idx = data["index"]
             blocks[idx] = dict(data["content_block"])
-            if blocks[idx].get("type") == "tool_use":
+            # Both custom tool_use and hosted server_tool_use stream their input
+            # as input_json_delta chunks that we reassemble.
+            if blocks[idx].get("type") in ("tool_use", "server_tool_use"):
                 blocks[idx].setdefault("input", {})
                 blocks[idx]["_input_partial"] = ""
         elif t == "content_block_delta":
@@ -139,15 +142,22 @@ async def _collect_tool_message(session, user_text, model) -> dict:
                 b["text"] = b.get("text", "") + delta["text"]
             elif delta["type"] == "input_json_delta":
                 b["_input_partial"] = b.get("_input_partial", "") + delta["partial_json"]
+            elif delta["type"] == "thinking_delta":
+                b["thinking"] = b.get("thinking", "") + delta.get("thinking", "")
+            elif delta["type"] == "signature_delta":
+                b["signature"] = (b.get("signature", "") or "") + delta.get("signature", "")
         elif t == "content_block_stop":
             idx = data["index"]
             b = blocks.get(idx) or {}
-            if b.get("type") == "tool_use":
+            if b.get("type") in ("tool_use", "server_tool_use"):
                 try:
                     b["input"] = json.loads(b.pop("_input_partial", "") or "{}")
                 except json.JSONDecodeError:
                     b["input"] = {}
                     b.pop("_input_partial", None)
+            # web_search_tool_result / web_fetch_tool_result blocks come with
+            # their content already populated at content_block_start time
+            # (synthesized from the SDK's UserMessage) — nothing to reassemble.
         elif t == "message_delta":
             d = data.get("delta") or {}
             msg["stop_reason"] = d.get("stop_reason", msg["stop_reason"])
@@ -187,6 +197,8 @@ async def create_message(req: MessageCreateRequest):
         session = await manager.create(
             system_prompt=_system_prompt_text(req),
             model=req.model,
+            effort=req.effort,
+            include_thinking=req.include_thinking,
         )
         ephemeral = True
 
@@ -215,6 +227,12 @@ async def create_message(req: MessageCreateRequest):
 
 
 async def _handle_tool_use_request(req: MessageCreateRequest):
+    # Split client's `tools` array: custom (need bridge + pause/resume) vs
+    # hosted (SDK-executed: WebSearch, WebFetch).
+    custom_tools, hosted_sdk_tools = split_tools(list(req.tools or []))
+    has_custom = bool(custom_tools)
+    has_hosted = bool(hosted_sdk_tools)
+
     tool_results = _trailing_tool_results(req)
     is_resume = tool_results is not None and req.session_id is not None
 
@@ -233,18 +251,25 @@ async def _handle_tool_use_request(req: MessageCreateRequest):
                 detail={"type": "invalid_request_error",
                         "message": f"session {req.session_id} not found (may have timed out)"},
             )
-        if not session.is_tool_session:
+        if not session.uses_pump:
             raise HTTPException(
                 400,
                 detail={"type": "invalid_request_error",
                         "message": f"session {req.session_id} was not created with tools"},
             )
+        ephemeral = False
     else:
         session = await manager.create(
             system_prompt=_system_prompt_text(req),
             model=req.model,
-            tools_spec=req.tools,
+            tools_spec=custom_tools or None,
+            hosted_sdk_tools=hosted_sdk_tools or None,
+            effort=req.effort,
+            include_thinking=req.include_thinking,
         )
+        # Hosted-only sessions don't need pause/resume — clean up after the
+        # response completes, same as a stateless plain-chat ephemeral.
+        ephemeral = not has_custom
 
     effective_model = session.model or req.model
 
@@ -270,12 +295,22 @@ async def _handle_tool_use_request(req: MessageCreateRequest):
 
     headers = {"x-conduit-session-id": session.id}
 
+    async def _cleanup() -> None:
+        if ephemeral:
+            await manager.delete(session.id)
+
     if req.stream:
         async def event_source():
-            async for ev in stream_tool_events(session, user_text, effective_model):
-                yield ev
+            try:
+                async for ev in stream_tool_events(session, user_text, effective_model):
+                    yield ev
+            finally:
+                await _cleanup()
 
         return EventSourceResponse(event_source(), headers=headers)
 
-    body = await _collect_tool_message(session, user_text, effective_model)
-    return JSONResponse(content=body, headers=headers)
+    try:
+        body = await _collect_tool_message(session, user_text, effective_model)
+        return JSONResponse(content=body, headers=headers)
+    finally:
+        await _cleanup()

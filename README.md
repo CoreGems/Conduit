@@ -150,6 +150,7 @@ All settings via env (`CONDUIT_*` prefix) or `.env` file:
 | `CONDUIT_PORT`                    | `8765`                        | Port                                 |
 | `CONDUIT_DEFAULT_MODEL`           | `claude-sonnet-4-6`           | Used when client doesn't specify     |
 | `CONDUIT_DEFAULT_SYSTEM_PROMPT`   | *(none)*                      | Server-side default system prompt    |
+| `CONDUIT_DEFAULT_EFFORT`          | *(none)*                      | Default thinking effort: `low`/`medium`/`high`/`xhigh`/`max`. Bound at session creation. |
 | `CONDUIT_ALLOWED_TOOLS`           | `[]`                          | Tools the agent may use (pure chat by default) |
 | `CONDUIT_SESSION_IDLE_TIMEOUT_S`  | `1800`                        | Sessions evicted after N idle seconds |
 | `CONDUIT_MAX_SESSIONS`            | `100`                         | Hard cap on concurrent sessions      |

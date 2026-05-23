@@ -28,13 +28,13 @@ function Stop-OnPort([int]$p) {
         return
     }
     foreach ($c in $conns) {
-        $pid = $c.OwningProcess
+        $procId = $c.OwningProcess
         try {
-            $proc = Get-Process -Id $pid -ErrorAction Stop
-            Write-Host "[run] killing PID $pid ($($proc.ProcessName)) on port $p" -ForegroundColor Yellow
-            Stop-Process -Id $pid -Force -ErrorAction Stop
+            $proc = Get-Process -Id $procId -ErrorAction Stop
+            Write-Host "[run] killing PID $procId ($($proc.ProcessName)) on port $p" -ForegroundColor Yellow
+            Stop-Process -Id $procId -Force -ErrorAction Stop
         } catch {
-            Write-Warning "[run] could not stop PID ${pid}: $_"
+            Write-Warning "[run] could not stop PID ${procId}: $_"
         }
     }
     # Give Windows a moment to release the socket

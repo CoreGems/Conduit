@@ -13,6 +13,8 @@ router = APIRouter(prefix="/v1/sessions", tags=["sessions"])
 class CreateSessionRequest(BaseModel):
     system_prompt: str | None = None
     model: str | None = None
+    effort: str | None = None  # 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+    include_thinking: bool = False
 
 
 @router.get("", response_model=SessionList)
@@ -33,7 +35,12 @@ async def list_sessions() -> SessionList:
 @router.post("", response_model=CreateSessionResponse)
 async def create_session(req: CreateSessionRequest | None = None) -> CreateSessionResponse:
     req = req or CreateSessionRequest()
-    s = await manager.create(system_prompt=req.system_prompt, model=req.model)
+    s = await manager.create(
+        system_prompt=req.system_prompt,
+        model=req.model,
+        effort=req.effort,
+        include_thinking=req.include_thinking,
+    )
     return CreateSessionResponse(session_id=s.id)
 
 

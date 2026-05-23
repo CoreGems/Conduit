@@ -14,6 +14,7 @@ from anthropic.types import (  # noqa: F401  re-exported for callers
     MessageParam,
     TextBlockParam,
     ToolParam,
+    ToolUnionParam,
     ToolUseBlock,
     ToolResultBlockParam,
     Usage,
@@ -38,8 +39,20 @@ class MessageCreateRequest(BaseModel):
     temperature: float | None = None
     stop_sequences: list[str] | None = None
 
-    tools: list[ToolParam] | None = None
+    # ToolUnionParam covers both custom function tools and hosted server tools
+    # (WebSearch/WebFetch/Bash/TextEditor/CodeExecution variants).
+    tools: list[ToolUnionParam] | None = None
     tool_choice: dict | None = None
+
+    # Conduit extension — Claude API "effort" enum, controls reasoning budget.
+    # Bound at session creation; ignored on subsequent turns through a stateful session.
+    effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
+
+    # Conduit extension — when true, the response stream includes the model's
+    # `thinking` content blocks (Anthropic-canonical wire format) instead of
+    # stripping them. Bound at session creation. The model still does thinking
+    # based on its own `effort`/`thinking` settings; this only controls forwarding.
+    include_thinking: bool = False
 
     @field_validator("messages", mode="after")
     @classmethod

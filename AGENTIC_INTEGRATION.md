@@ -16,9 +16,11 @@ read the rest of the docs to build a working integration.
 | Auth header on requests | Either omit, or send any non-empty `x-api-key` (the official Anthropic SDK requires one — value is ignored) |
 | Content-Type for POSTs | `application/json` |
 | Streaming format | Server-Sent Events (`text/event-stream`) |
-| Conduit-specific extension | `session_id` field in request body + `x-conduit-session-id` response header |
-| Drop-in OK | Yes — pointing the official `anthropic` SDK at the base URL works for chat *and* streaming |
+| Conduit-specific extensions | `session_id` field, `effort` field, `include_thinking` field, `x-conduit-session-id` response header |
+| Drop-in OK | Yes — pointing the official `anthropic` SDK at the base URL works for chat *and* streaming. For Conduit-only fields like `effort` / `include_thinking`, use `extra_body={...}` |
 | Tool support | **Phase 2**: single-tool, single-call per turn. Parallel/sequential calls not yet supported. |
+| Thinking budget | `effort: "low" \| "medium" \| "high" \| "xhigh" \| "max"` — Conduit extension, bound at session creation. See §4.4 and `EFFORT_INTEGRATION.md` for the deep dive. |
+| Hosted server tools | `WebSearch` and `WebFetch` — declare Anthropic-style in `tools[]`, SDK executes internally. Response carries `server_tool_use` + `web_search_tool_result` / `web_fetch_tool_result` blocks alongside the final `text`, all with `stop_reason: end_turn`. **No pause/resume**. See §5.6 and `WEBSEARCH_INTEGRATION.md` / `PASSTHROUGH_INTEGRATION.md`. |
 
 ---
 
@@ -61,8 +63,10 @@ The chat endpoint. Mirrors Anthropic's `/v1/messages` exactly, plus `session_id`
 | `stream` | bool | ❌ default `false` | `true` → SSE; `false` → single JSON object. |
 | `temperature` | float | ❌ | Standard Anthropic. |
 | `stop_sequences` | string[] | ❌ | Standard Anthropic. |
-| `tools` | `ToolParam[]` | ❌ | Triggers tool-use mode (see §5). |
+| `tools` | `ToolUnionParam[]` | ❌ | Mix of custom function tools and/or hosted server tools (WebSearch/WebFetch). Conduit splits internally. See §5 (custom pause/resume) and §5.6 (hosted, no pause). |
 | `tool_choice` | object | ❌ | Accepted but **currently ignored** in Phase 2. |
+| **`effort`** | `"low" \| "medium" \| "high" \| "xhigh" \| "max"` | ❌ | **Conduit extension.** Maps to the Agent SDK's `effort` field — controls thinking budget. Bound at session creation; ignored on subsequent turns of a stateful session. |
+| **`include_thinking`** | bool | ❌ default `false` | **Conduit extension.** When true, response includes `thinking` content blocks (Anthropic-canonical). The model thinks regardless; this flag only controls forwarding. Bound at session creation. See `THINKING_INTEGRATION.md`. |
 | **`session_id`** | string | ❌ | **Conduit extension.** Without it: stateless or auto-allocated. With it: continue an existing session. See §4. |
 
 **Response — `stream=false`:** the standard Anthropic `Message` object, JSON.
@@ -109,9 +113,13 @@ Explicit session creation (for stateful chat without tools). For tool-use you ge
 
 **Request:**
 ```json
-{"system_prompt": "be brief", "model": "claude-haiku-4-5-20251001"}
+{
+  "system_prompt": "be brief",
+  "model": "claude-haiku-4-5-20251001",
+  "effort": "high"
+}
 ```
-Both fields optional. Empty body `{}` is valid.
+All fields optional. Empty body `{}` is valid. `effort` is locked at this moment and used for every turn through the resulting session.
 
 **Response:**
 ```json
@@ -150,7 +158,11 @@ See §1.2.
 | `"tool_result"` | `"tool_use_id": str`, `"content": str OR ContentBlock[]` | **User only** (you send these on resume) |
 | `"image"` | `"source": {...}` | User (not Phase 2 tested) |
 
-### 3.2 `ToolParam` (entries in `tools`)
+### 3.2 Tool declarations (entries in `tools`)
+
+Two kinds, both Anthropic-compatible:
+
+**Custom function tool** (client implements; pauses for `tool_result`):
 
 ```json
 {
@@ -164,7 +176,26 @@ See §1.2.
 }
 ```
 
-Names are **bare** on both directions of the wire. The server's internal MCP prefix (`mcp__conduit__X`) is invisible to clients.
+**Hosted server tool** (SDK executes; no pause):
+
+```json
+// WebSearch — `name` must be the literal "web_search"
+{"type": "web_search_20250305", "name": "web_search"}
+{"type": "web_search_20260209", "name": "web_search"}
+
+// WebFetch — `name` must be the literal "web_fetch"
+{"type": "web_fetch_20250910", "name": "web_fetch"}
+{"type": "web_fetch_20260209", "name": "web_fetch"}
+{"type": "web_fetch_20260309", "name": "web_fetch"}
+```
+
+⚠️ **Both `type` and `name` are required, and `name` is a pydantic literal validated against Anthropic's schema** — you cannot rename them. Sending `{"name": "WebSearch"}`, `{"name": "web_search_sdk"}`, or omitting `name` produces a 422 before Conduit ever sees the request. Use the exact canonical strings.
+
+The `type` prefix (`web_search` / `web_fetch`) is what triggers Conduit's hosted detection; the version date is forwarded to the SDK.
+
+**Name collision with custom function tools.** Because hosted names are fixed, you cannot have a custom function tool also named `web_search` in the same request. Dedupe client-side: if the request already declares a tool with that name, skip injecting the hosted variant.
+
+Custom-tool names are **bare** on both directions of the wire. The server's internal MCP prefix (`mcp__conduit__X`) is invisible to clients.
 
 ### 3.3 Non-streaming response shape
 
@@ -268,9 +299,26 @@ When `session_id` is present, the server keeps history. You **only** need to sen
 
 **Model binding:** the model is fixed at session creation. The `model` field in subsequent requests through that session is **ignored at the SDK layer** but echoed in the response. If you need a different model, create a new session.
 
+**Effort binding:** identical rule. `effort` is read once when the session is created and applies to every turn through that session. Sending a different `effort` on a follow-up request is silently ignored.
+
 ### 4.3 Tool-use
 
 See §5.
+
+### 4.4 Conduit-specific extensions
+
+Three fields/headers Conduit adds on top of the Anthropic wire format. All optional; all designed so that a request without them behaves exactly like upstream Anthropic.
+
+| Extension | Where | Type | Purpose |
+|---|---|---|---|
+| `session_id` | request body | string | Continue an existing server-side session. See §4.2, §5. |
+| `effort` | request body | `"low" \| "medium" \| "high" \| "xhigh" \| "max"` | Set thinking-budget at session creation. Pydantic-validated; bad values → 422. |
+| `include_thinking` | request body | bool | When true, response carries `thinking` content blocks. Bound at session creation. Pure forwarding switch — doesn't affect generation. |
+| `x-conduit-session-id` | response header | string (uuid) | The session this response was served from. Auto-allocated for tool-use turns; capture it to resume. |
+
+Defaults are sourced from the server's env (`CONDUIT_DEFAULT_MODEL`, `CONDUIT_DEFAULT_EFFORT`) if you omit a field. If the env var is also unset, the SDK's own defaults apply.
+
+For the deep dive on `effort` — values, latency/cost expectations, code recipes for each language — see **`EFFORT_INTEGRATION.md`**.
 
 ---
 
@@ -396,6 +444,54 @@ POST /v1/messages
 | 400 | `session_id` is for a non-tool session |
 | 404 | `session_id` not found (likely timed out) — start over |
 
+### 5.6 Hosted tools (WebSearch / WebFetch) — one request, no pause
+
+For hosted server tools, the protocol simplifies dramatically. Declare them in `tools[]` and send **one** request:
+
+```json
+POST /v1/messages
+{
+  "model": "claude-sonnet-4-6",
+  "max_tokens": 512,
+  "tools": [
+    {"type": "web_search_20250305", "name": "web_search"},
+    {"type": "web_fetch_20250910",  "name": "web_fetch"}
+  ],
+  "messages": [{"role": "user", "content": "What's the latest stable FastAPI?"}]
+}
+```
+
+You get **one** response back, with `stop_reason: "end_turn"`. The Agent SDK ran the search/fetch internally; the response's `content[]` array carries:
+
+- `server_tool_use` blocks — what the model called (`name`, `input`)
+- `web_search_tool_result` / `web_fetch_tool_result` blocks — what the SDK fed back (correlated by `tool_use_id`)
+- `text` blocks — the model's final synthesized answer (often with markdown citations)
+
+The hidden SDK turn boundary (the internal `stop_reason: "tool_use"` and continuation `message_start`) is suppressed so it all looks like one continuous turn from the client's perspective.
+
+| | Custom tools (`get_weather`) | Hosted tools (`WebSearch`/`WebFetch`) |
+|---|---|---|
+| Client requests per turn | 2+ (initial + `tool_result` resume) | **1** |
+| Client implements the tool? | Yes | No — SDK executes |
+| Tool-use blocks in `content[]` | `tool_use` (client must execute) | `server_tool_use` + `web_search_tool_result` / `web_fetch_tool_result` (already executed, visibility only) |
+| `stop_reason` returned | `tool_use` → then `end_turn` | **`end_turn`** straight away |
+| Where the loop lives | Your code | Inside the model |
+| Session lifecycle | Persists across pause/resume | Auto-allocated and torn down after the response |
+
+**Mixed-mode is supported.** You can declare hosted and custom tools in the same `tools[]`. The model picks; if it picks a hosted one you get a continuous turn, if it picks a custom one you get the standard `stop_reason: tool_use` pause and follow §5.2.
+
+**The model decides when to invoke.** Declaring `web_search` doesn't force the model to use it — tools are advisory. Anchor with a system prompt if you want to discourage spurious searches:
+
+```python
+"system": "Only use web_search or web_fetch when the user is asking about "
+          "recent events, current versions, or information you don't already "
+          "know. For evergreen topics, answer from your training."
+```
+
+For the full hosted-tool reference (cost/latency, all accepted JSON shapes, debugging, Phase 2.5 limits like `allowed_domains` not yet wired through), see **`WEBSEARCH_INTEGRATION.md`**.
+
+For the deep dive on the response shape — every block type, how to parse `*_tool_result.content`, how the SSE stream interleaves the new blocks, and what client-side code needs to change — see **`PASSTHROUGH_INTEGRATION.md`**.
+
 ---
 
 ## 6. Limitations (Phase 2)
@@ -408,6 +504,9 @@ The protocol is the Anthropic protocol — these are implementation limits, not 
 4. **Per-session model lock** — see §4.2.
 5. **Session timeout** is 30 min default. If your tool execution takes longer than that, the resume request will 404. Move long-running work to async background and respond fast to Conduit.
 6. **Thinking blocks filtered.** If you specifically need extended-thinking output, it's stripped from the stream.
+7. **Hosted-tool `allowed_domains` / `blocked_domains` / `max_uses` not yet wired through.** Conduit accepts them on the request (schema validation passes) but doesn't propagate them to the SDK. The SDK uses its own defaults.
+8. **Hosted-only sessions can't be reused.** Server tears them down after the response. Each hosted-only request is independent; the `x-conduit-session-id` header is informational only.
+9. **WebFetch doesn't render JavaScript.** Server-side fetch only — modern SPAs may return thin content.
 
 ---
 
@@ -670,7 +769,107 @@ async fn tool_round_trip(client: &Client) -> Result<(), Box<dyn std::error::Erro
 }
 ```
 
-### 8.6 curl
+### 8.6 Setting `effort` (Conduit extension)
+
+Plain httpx — add `effort` to the request body alongside the standard fields:
+
+```python
+import httpx
+
+r = httpx.post("http://127.0.0.1:8765/v1/messages", json={
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 1024,
+    "effort": "high",                              # ← here
+    "messages": [{"role": "user", "content": "Find primes of 851."}],
+}, timeout=120)
+```
+
+Official `anthropic` SDK — `effort` is **not** in the upstream Anthropic API,
+so the SDK strips it from top-level kwargs. Pass via `extra_body`:
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic(base_url="http://127.0.0.1:8765", api_key="not-used")
+
+msg = client.messages.create(
+    model="claude-sonnet-4-6",
+    max_tokens=1024,
+    extra_body={"effort": "xhigh"},                # ← Conduit-only knob
+    messages=[{"role": "user", "content": "..."}],
+)
+```
+
+Setting effort once and reusing for many turns:
+
+```python
+sid = httpx.post("http://127.0.0.1:8765/v1/sessions", json={
+    "effort": "high", "model": "claude-sonnet-4-6"
+}).json()["session_id"]
+
+# Every turn through `sid` runs at effort=high; the field is ignored if sent again.
+httpx.post("http://127.0.0.1:8765/v1/messages", json={
+    "model": "claude-sonnet-4-6", "max_tokens": 512,
+    "session_id": sid,
+    "messages": [{"role": "user", "content": "..."}],
+})
+```
+
+### 8.7 Hosted tools — WebSearch / WebFetch (Conduit's hosted-tool pattern)
+
+One request, model orchestrates all search/fetch internally, response is plain text with citations:
+
+```python
+import httpx
+
+r = httpx.post("http://127.0.0.1:8765/v1/messages", json={
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 512,
+    "tools": [
+        {"type": "web_search_20250305", "name": "web_search"},
+        {"type": "web_fetch_20250910",  "name": "web_fetch"},
+    ],
+    "messages": [{"role": "user",
+                  "content": "What's the most recent stable FastAPI release? Cite the source."}],
+}, timeout=120)
+msg = r.json()
+print(msg["content"][0]["text"])
+# **0.136.1**
+# Sources:
+# - [Releases · fastapi/fastapi](https://github.com/...)
+# - [fastapi · PyPI](https://pypi.org/...)
+```
+
+Official Anthropic SDK works too — hosted tools are part of the upstream wire format, so no `extra_body` needed for them:
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic(base_url="http://127.0.0.1:8765", api_key="not-used")
+msg = client.messages.create(
+    model="claude-sonnet-4-6",
+    max_tokens=512,
+    tools=[{"type": "web_search_20250305", "name": "web_search"}],
+    messages=[{"role": "user", "content": "Latest stable Python release?"}],
+)
+print(msg.content[0].text)
+```
+
+Mixed hosted + custom — same code as §8.2 but add hosted entries to `tools[]`:
+
+```python
+tools = [
+    {"type": "web_search_20250305", "name": "web_search"},   # hosted, invisible
+    WEATHER_TOOL,                                              # custom, pauses
+]
+r1 = httpx.post(URL + "/v1/messages", json={..., "tools": tools, ...})
+# If stop_reason == "tool_use", the model picked the CUSTOM tool — handle the
+# normal pause/resume from §8.2. Hosted tools never produce a visible pause.
+```
+
+The Rust pattern is identical to §8.4/§8.5 — just include hosted entries in the `tools` JSON array. No new client-side code paths.
+
+### 8.8 curl
 
 ```bash
 # Non-streaming
@@ -715,6 +914,17 @@ curl -i -sS -X POST http://127.0.0.1:8765/v1/messages \
 8. **Idle timeout starts at last access**, not at session creation. Each `/v1/messages` request resets it.
 9. **Index numbering** in SSE events is per-message-start. Don't carry indices across turns.
 10. **Content-Type matters.** Always set `Content-Type: application/json`. The server doesn't accept form-encoded bodies.
+11. **`effort` via the official Anthropic SDK requires `extra_body`.** The SDK silently drops unknown top-level kwargs. `client.messages.create(..., effort="high")` will NOT send the field. Use `extra_body={"effort": "high"}`.
+12. **`effort` values are case-sensitive lowercase.** `"High"` or `"HIGH"` → 422 validation error.
+13. **Setting `effort` on a turn through an existing session does nothing.** Effort is locked at session creation, same rule as `model`. To change effort mid-conversation, create a new session.
+14. **Hosted-tool `name` is a pydantic literal.** Must be exactly `"web_search"` (lowercase) for any `web_search_*` type, exactly `"web_fetch"` for any `web_fetch_*` type. Renaming (`"WebSearch"`, `"web_search_sdk"`, etc.) returns 422 — schema validation rejects it before Conduit's hosted-vs-custom splitter ever runs.
+17. **Hosted tools emit `server_tool_use`, NOT `tool_use`.** Client-pause-style `tool_use` blocks are exclusive to custom function tools (where you must execute and send `tool_result`). Hosted blocks carry `type: "server_tool_use"` so you can distinguish them at the type level. The paired result block is `type: "web_search_tool_result"` or `"web_fetch_tool_result"`.
+18. **`*_tool_result.content` is a string, not a list of blocks.** It includes embedded JSON `Links: [{title, url}]` plus a textual summary. The format is the SDK's; parse markdown citations from the trailing `text` block for stability. See `PASSTHROUGH_INTEGRATION.md` §4.
+19. **`content[]` is no longer a single-block array for hosted-tool turns.** If your client asserted `len(content) == 1` or used `content[0]` to mean "the answer", it'll break now — iterate by `type` instead. See `PASSTHROUGH_INTEGRATION.md` §7 for migration notes.
+20. **`include_thinking` doesn't change model behaviour, only forwarding.** The model thinks based on `effort` (and SDK defaults). Setting `include_thinking=true` on a simple-prompt low-effort request will yield no thinking blocks — the model just didn't think. See `THINKING_INTEGRATION.md` §1.
+21. **Thinking blocks come with a `signature` field.** It's an opaque cryptographic blob the SDK uses internally. Don't parse, reformat, or truncate it. If round-tripping the assistant message elsewhere, pass it verbatim.
+15. **Hosted-only requests don't need `x-conduit-session-id` handling.** The header is emitted but the session is torn down immediately after the response. Trying to reuse the id will return 404. Resume-style requests are only for custom-tool sessions.
+16. **The model decides when to use hosted tools.** Declaring `web_search` is advisory. Sonnet/Haiku tend to over-use it (searching even for evergreen questions). Add a system prompt restriction if cost matters.
 
 ---
 
@@ -743,6 +953,27 @@ curl -i -sS -X POST http://127.0.0.1:8765/v1/messages \
 ### 10.6 You want to confirm wire-format parity
 - Run the official `anthropic` Python SDK against `base_url=http://127.0.0.1:8765`. If it works there, your wire format is right. There is no way to be more wire-compatible than that.
 
+### 10.7 `effort` doesn't seem to be taking effect
+- Sending `effort` through the Anthropic SDK without `extra_body`: the SDK drops unknown kwargs silently. Check your code for the literal string `extra_body`.
+- Sending `effort` on a request that has `session_id` set: bound at creation, can't change mid-session. Verify by `GET /v1/sessions` and checking which one is being reused, or by creating a fresh session.
+- Confirming it's even being applied: run `scripts/effort_test.py` — it measures latency at each level so a meaningful difference proves the knob is wired.
+
+### 10.8 422 Unprocessable Entity when declaring hosted tools
+- Most common cause: non-canonical `name` field. Pydantic requires exactly `"web_search"` or `"web_fetch"` (lowercase, no suffix). Using `"WebSearch"` or a custom name like `"web_search_sdk"` fails the literal check.
+- The 422 body is large — pydantic tries every member of `ToolUnionParam` and reports one error per failed match. Look for the `WebSearchTool*Param.name` line specifically; it will read `"Input should be 'web_search'"`.
+- Fix: `{"type": "web_search_20250305", "name": "web_search"}` exactly.
+
+### 10.9 Hosted tool appears as a `tool_use` block / pauses with `stop_reason: tool_use`
+- The request was accepted as a *custom* tool, not hosted. Two common reasons:
+  - You included `input_schema` — hosted tools have no input schema. Remove it.
+  - Your `type` didn't match a `web_search_*` or `web_fetch_*` prefix (typo? wrong version?). The detector matches by prefix; if it doesn't match, the tool falls through to the custom path and Conduit builds a bridge nobody will satisfy.
+- Run `scripts/websearch_test.py` to confirm canonical declarations work on your installation.
+
+### 10.9 Response is slow when you declared web tools
+- Each hosted-tool invocation adds real network latency (~3-6s for search, ~2-5s for fetch). Chains can run 10s+. This is the tool calls, not Conduit overhead.
+- Use a tighter `system` prompt to discourage unnecessary searches.
+- For latency-critical UX, don't declare hosted tools by default — opt in per-request.
+
 ---
 
 ## 11. Versioning expectations
@@ -761,8 +992,11 @@ For an agent integrating this for the first time:
 
 - [ ] Confirm `GET /health` returns 200.
 - [ ] Confirm `POST /v1/messages` with `{"model":..., "max_tokens":16, "messages":[{"role":"user","content":"ping"}]}` returns a valid Message with `stop_reason: "end_turn"`.
-- [ ] If using tools: declare them, send initial request, capture `x-conduit-session-id` header and the `tool_use` block's `id`.
+- [ ] If using `effort`: pass it in the request body (or `extra_body={"effort": "..."}` via the Anthropic SDK); send a bad value (`"extreme"`) and confirm 422; consider running `scripts/effort_test.py`'s latency sweep to confirm it's wired through.
+- [ ] If using custom tools: declare them, send initial request, capture `x-conduit-session-id` header and the `tool_use` block's `id`.
 - [ ] Execute the tool client-side.
 - [ ] Send resume request with `session_id`, `tools` (same list), and a trailing user message whose content is `[{"type":"tool_result","tool_use_id":<id>,"content":<your result>}]`.
 - [ ] Receive the final answer with `stop_reason: "end_turn"`.
 - [ ] Optionally `DELETE /v1/sessions/<id>`.
+- [ ] If using hosted tools (`web_search` / `web_fetch`): declare them with `{"type": "web_search_20250305", "name": "web_search"}` (or shorthand `{"name": "WebSearch"}`); send a single request asking a current-events question; expect `stop_reason: "end_turn"`, plain text with citations inline, **no** `tool_use` blocks in `content[]`.
+- [ ] Consider running `scripts/websearch_test.py` to verify all four hosted-tool scenarios (WebSearch alone, WebFetch alone, both together, mixed hosted+custom).
