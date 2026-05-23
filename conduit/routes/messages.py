@@ -18,7 +18,7 @@ import uuid
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
-from sse_starlette.sse import EventSourceResponse
+from sse_starlette.sse import EventSourceResponse  # noqa: F401  (used in route)
 
 from conduit.schema import MessageCreateRequest
 from conduit.sessions import manager
@@ -77,6 +77,61 @@ def _system_prompt_text(req: MessageCreateRequest) -> str | None:
         ]
         return "\n".join(parts) if parts else None
     return None
+
+
+def _text_of_content(content) -> str:
+    """Flatten a message content (str OR list of blocks) to a plain string."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            b["text"] for b in content
+            if isinstance(b, dict) and b.get("type") == "text" and "text" in b
+        ]
+        return "\n".join(parts)
+    return ""
+
+
+def _build_replay_prompt(req: MessageCreateRequest) -> str:
+    """For stateless multi-turn (Pattern A): the SDK session is fresh and has
+    no context, so concatenate the conversation history into the user prompt
+    we send. Single-turn requests fall back to just the user text.
+    """
+    msgs = list(req.messages)
+    if not msgs:
+        raise HTTPException(400, detail={"type": "invalid_request_error", "message": "messages array is empty"})
+
+    # Single-turn (one user message) — no replay needed.
+    if len(msgs) == 1 and msgs[0].get("role") == "user":
+        text = _text_of_content(msgs[0].get("content"))
+        if not text:
+            raise HTTPException(400, detail={"type": "invalid_request_error", "message": "no user text content in messages"})
+        return text
+
+    # Multi-turn — replay everything as one prompt.
+    history_lines: list[str] = []
+    for m in msgs[:-1]:
+        role = m.get("role", "")
+        text = _text_of_content(m.get("content"))
+        if not text:
+            continue
+        if role == "user":
+            history_lines.append(f"User: {text}")
+        elif role == "assistant":
+            history_lines.append(f"Assistant: {text}")
+
+    last = msgs[-1]
+    if last.get("role") != "user":
+        raise HTTPException(400, detail={"type": "invalid_request_error", "message": "last message must be from the user"})
+    last_text = _text_of_content(last.get("content"))
+    if not last_text:
+        raise HTTPException(400, detail={"type": "invalid_request_error", "message": "no user text content in final message"})
+
+    if not history_lines:
+        return last_text
+
+    history = "\n\n".join(history_lines)
+    return f"{history}\n\nUser: {last_text}"
 
 
 def _trailing_tool_results(req: MessageCreateRequest) -> list[dict] | None:
@@ -182,48 +237,44 @@ async def create_message(req: MessageCreateRequest):
     if has_tools:
         return await _handle_tool_use_request(req)
 
-    # ----- plain chat path (unchanged) -----------------------------------
-    user_text = _last_user_text(req)
-
+    # ----- plain chat path -----------------------------------------------
     if req.session_id:
+        # Stateful: server owns history; client sends only the new user turn.
         session = await manager.get(req.session_id)
         if session is None:
             raise HTTPException(
                 404,
                 detail={"type": "invalid_request_error", "message": f"session {req.session_id} not found"},
             )
-        ephemeral = False
+        user_text = _last_user_text(req)
     else:
+        # Stateless / auto-allocated: create a fresh session and replay the
+        # client's full message history into the prompt so the model has
+        # context. Sessions are non-ephemeral now — the client can reuse the
+        # `x-conduit-session-id` header value on subsequent turns to switch
+        # to Pattern B (server-managed history). Idle sweeper reaps unused.
         session = await manager.create(
             system_prompt=_system_prompt_text(req),
             model=req.model,
             effort=req.effort,
             include_thinking=req.include_thinking,
         )
-        ephemeral = True
-
-    async def _cleanup() -> None:
-        if ephemeral:
-            await manager.delete(session.id)
+        user_text = _build_replay_prompt(req)
 
     effective_model = session.model or req.model
+    headers = {"x-conduit-session-id": session.id}
 
     if req.stream:
         async def event_source():
-            try:
-                async with session.lock:
-                    async for ev in stream_anthropic_events(session, user_text, effective_model):
-                        yield ev
-            finally:
-                await _cleanup()
+            async with session.lock:
+                async for ev in stream_anthropic_events(session, user_text, effective_model):
+                    yield ev
 
-        return EventSourceResponse(event_source())
+        return EventSourceResponse(event_source(), headers=headers)
 
-    try:
-        async with session.lock:
-            return await collect_non_streaming(session, user_text, effective_model)
-    finally:
-        await _cleanup()
+    async with session.lock:
+        body = await collect_non_streaming(session, user_text, effective_model)
+    return JSONResponse(content=body, headers=headers)
 
 
 async def _handle_tool_use_request(req: MessageCreateRequest):
@@ -267,9 +318,10 @@ async def _handle_tool_use_request(req: MessageCreateRequest):
             effort=req.effort,
             include_thinking=req.include_thinking,
         )
-        # Hosted-only sessions don't need pause/resume — clean up after the
-        # response completes, same as a stateless plain-chat ephemeral.
-        ephemeral = not has_custom
+        # All tool-use sessions are kept alive after the response — client may
+        # want to reuse the session_id from the x-conduit-session-id header for
+        # follow-up turns (works for both custom and hosted-only tool sessions).
+        # The idle sweeper reaps unused ones after CONDUIT_SESSION_IDLE_TIMEOUT_S.
 
     effective_model = session.model or req.model
 
@@ -291,13 +343,32 @@ async def _handle_tool_use_request(req: MessageCreateRequest):
             session.deliver_tool_result(block["tool_use_id"], block.get("content"))
         user_text: str | None = None  # don't call query() on resume
     else:
-        user_text = _last_user_text(req)
+        # Choose user_text the same way plain chat does:
+        #   - With session_id (Pattern B): session has state, only need new turn.
+        #   - Without session_id (Pattern A): replay client's full history into prompt.
+        if req.session_id:
+            user_text = _last_user_text(req)
+        else:
+            user_text = _build_replay_prompt(req)
 
     headers = {"x-conduit-session-id": session.id}
 
-    async def _cleanup() -> None:
-        if ephemeral:
-            await manager.delete(session.id)
+    async def _drain_trailing_pump() -> None:
+        """After the HTTP response ends, give the pump a brief window to
+        finish draining receive_response() (e.g. the trailing ResultMessage
+        after end_turn). This keeps the session in a clean state so the next
+        turn can start a fresh receive_response iterator. If the pump is
+        actually paused for tools (pending Futures present), don't wait —
+        that pump is supposed to stay alive across HTTP requests."""
+        import asyncio
+        if session.pending_futures:
+            return
+        if session.pump_task is None or session.pump_task.done():
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(session.pump_task), timeout=5.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError, BaseException):
+            pass
 
     if req.stream:
         async def event_source():
@@ -305,12 +376,12 @@ async def _handle_tool_use_request(req: MessageCreateRequest):
                 async for ev in stream_tool_events(session, user_text, effective_model):
                     yield ev
             finally:
-                await _cleanup()
+                await _drain_trailing_pump()
 
         return EventSourceResponse(event_source(), headers=headers)
 
     try:
         body = await _collect_tool_message(session, user_text, effective_model)
-        return JSONResponse(content=body, headers=headers)
     finally:
-        await _cleanup()
+        await _drain_trailing_pump()
+    return JSONResponse(content=body, headers=headers)

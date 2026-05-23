@@ -77,8 +77,9 @@ def test_hosted_web_search_runs_transparently():
     assert wsrs[0]["content"], "empty web_search_tool_result content"
 
 
-def test_hosted_only_session_does_not_require_resume():
-    """A hosted-only session is ephemeral — server cleans it up after the response."""
+def test_hosted_only_session_is_reusable():
+    """A hosted-only session is kept alive (like plain chat) so the client can
+    reuse the session_id on follow-up turns. Idle sweeper reaps stale ones."""
     r = httpx.post(f"{URL}/v1/messages", json={
         "model": MODEL,
         "max_tokens": 200,
@@ -88,12 +89,63 @@ def test_hosted_only_session_does_not_require_resume():
     r.raise_for_status()
 
     sid = r.headers.get("x-conduit-session-id")
-    # Header is surfaced (auto-allocated), but the session should already be cleaned up.
-    assert sid is not None
+    assert sid is not None, "missing x-conduit-session-id on hosted-tool response"
+
+    # Session must still exist so the client can reuse it (Pattern B).
     sessions = httpx.get(f"{URL}/v1/sessions", timeout=10).json()["sessions"]
     sids = [s["session_id"] for s in sessions]
-    assert sid not in sids, (
-        f"hosted-only session {sid} not torn down after response — leak risk"
+    assert sid in sids, (
+        f"hosted-only session {sid} was torn down — Pattern B with web tools won't work"
+    )
+
+    # Reuse the same session on a second turn — should maintain context.
+    r2 = httpx.post(f"{URL}/v1/messages", json={
+        "model": MODEL,
+        "max_tokens": 80,
+        "tools": [WEB_SEARCH_DECL],
+        "session_id": sid,
+        "messages": [{"role": "user", "content": "What did I just ask you about? One short sentence."}],
+    }, timeout=120)
+    r2.raise_for_status()
+    text2 = "".join(b.get("text", "") for b in r2.json()["content"] if b["type"] == "text").lower()
+    assert "python" in text2, (
+        f"hosted-tool session didn't preserve context across turns: {text2!r}"
+    )
+
+    httpx.delete(f"{URL}/v1/sessions/{sid}", timeout=10)
+
+
+def test_hosted_pattern_a_full_history_works():
+    """Pattern A (full history, no session_id) must work even when hosted tools
+    are declared. Previously broken: hosted requests went through _last_user_text
+    and discarded history."""
+    history = [
+        {"role": "user", "content": "Pick a single European capital. Just the name on one line."},
+    ]
+    r1 = httpx.post(f"{URL}/v1/messages", json={
+        "model": MODEL,
+        "max_tokens": 64,
+        "tools": [WEB_SEARCH_DECL],
+        "messages": history,
+    }, timeout=120)
+    r1.raise_for_status()
+    msg1 = r1.json()
+    city = "".join(b.get("text", "") for b in msg1["content"] if b["type"] == "text").strip()
+    history.append({"role": "assistant", "content": city})
+    history.append({"role": "user", "content": "What country is that city in? One short sentence."})
+
+    r2 = httpx.post(f"{URL}/v1/messages", json={
+        "model": MODEL,
+        "max_tokens": 120,
+        "tools": [WEB_SEARCH_DECL],   # hosted tool still declared
+        "messages": history,           # full history, no session_id
+    }, timeout=120)
+    r2.raise_for_status()
+    text2 = "".join(b.get("text", "") for b in r2.json()["content"] if b["type"] == "text")
+
+    key = city.split()[0].rstrip(".,!?").lower()
+    assert key in text2.lower(), (
+        f"Pattern A + hosted tools broken: turn-2 reply {text2!r} doesn't reference city {key!r}"
     )
 
 

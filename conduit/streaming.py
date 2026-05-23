@@ -198,10 +198,12 @@ _PUMP_END_SENTINEL: Any = object()
 
 
 async def _pump_session(session: Session) -> None:
-    """Drain receive_response() into the session's event queue.
+    """Drain one turn of receive_response() into the session's event queue.
 
-    Runs until the SDK's async generator returns (i.e. the multi-turn
-    turn-with-tools is complete) or until cancelled by session deletion.
+    The SDK's receive_response() is per-query: it yields events from a single
+    query() call through to the trailing ResultMessage, then exhausts. The
+    pump exits naturally at that point. For Conduit's multi-turn support,
+    stream_tool_events creates a fresh pump per new turn.
     """
     try:
         async for msg in session.client.receive_response():
@@ -237,13 +239,26 @@ async def stream_tool_events(
     if session.events_queue is None:
         raise RuntimeError("stream_tool_events called on non-tool session")
 
-    # Make sure the pump is running. Start it lazily on first use.
-    if session.pump_task is None or session.pump_task.done():
-        session.pump_task = asyncio.create_task(_pump_session(session))
-
-    # Kick off a fresh SDK turn if this is the initial request.
     if user_text is not None:
-        await session.client.query(user_text)
+        # New turn. Each SDK receive_response() is per-query() — it yields
+        # events for one query and exhausts after ResultMessage. If the prior
+        # pump is still alive (custom-tool pause: parked in @tool handler,
+        # holding the iterator open across HTTP requests), reuse it; the new
+        # query() flows through the existing iterator. Otherwise start fresh.
+        # Note: routes/messages.py awaits pump_task at the end of each turn
+        # via _drain_trailing_pump, so by the time a multi-turn request hits
+        # us with the prior turn fully done, pump_task.done() == True.
+        if session.pump_task is None or session.pump_task.done():
+            session.events_queue = asyncio.Queue()
+            await session.client.query(user_text)
+            session.pump_task = asyncio.create_task(_pump_session(session))
+        else:
+            await session.client.query(user_text)
+    else:
+        # Resume (tool_result delivered above). The pump must still be alive,
+        # parked inside the @tool handler awaiting our Future.
+        if session.pump_task is None or session.pump_task.done():
+            raise RuntimeError("resume request but pump task is no longer running")
 
     session.state = SessionState.STREAMING
 

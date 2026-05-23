@@ -355,7 +355,7 @@ These costs come out of your Claude Max subscription's Agent SDK quota (and out 
 2. **`max_uses` not enforced.** Same — accepted in the spec but the SDK runs as many as the model wants.
 3. ~~No `server_tool_use` / `web_search_tool_result` blocks in responses.~~ **Implemented.** Conduit now emits both, Anthropic-canonical. See §3.1.
 4. **`user_location` / `user_timezone` not propagated** to the SDK's WebSearch — the SDK uses its own defaults.
-5. **Hosted-only sessions can't be reused.** Because we tear them down after the response (no pause expected).
+5. ~~Hosted-only sessions can't be reused.~~ **Fixed.** Sessions persist after the response (sweeper reaps idle ones). Reuse `session_id` from the response header on follow-up turns to maintain context across multi-turn hosted-tool conversations.
 
 ---
 

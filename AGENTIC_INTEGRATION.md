@@ -291,11 +291,17 @@ POST /v1/messages
 
 ### 4.2 Stateful chat (no tools)
 
-Two paths:
-1. Auto-allocated: omit `session_id`, response header carries the new id. Server keeps it.
-2. Explicit: `POST /v1/sessions` first, then send `session_id` on every `/v1/messages`.
+Three paths, pick whichever fits your client's model:
 
-When `session_id` is present, the server keeps history. You **only** need to send the new user turn in `messages`, not the whole history. (You can still send the whole history — the server only reads the most recent user message in stateful mode.)
+1. **Pattern A (stateless, Anthropic-drop-in).** Omit `session_id`, send the full message history in `messages[]` every turn. Server creates a fresh session per request and **replays the entire history** into the prompt so the model has context. Most compatible with code written against the upstream Anthropic API. The response still carries `x-conduit-session-id` if you want to switch to Pattern B later.
+
+2. **Pattern B (stateful, Conduit-native).** Capture `x-conduit-session-id` from a response and reuse it on subsequent turns, sending **only the new user message** in `messages[]`. Server maintains conversation state via the Agent SDK; fewer tokens per request, faster after the first turn.
+
+3. **Explicit creation.** `POST /v1/sessions` first (lets you set `system_prompt`/`model`/`effort`/`include_thinking` up front), then use the returned `session_id` like Pattern B.
+
+You can also send `session_id` **and** full history — Conduit reads only the last user message in stateful mode, so the redundant history is ignored. Works (no harm) but wastes bandwidth.
+
+**Pure-stateless WITHOUT history doesn't work.** Sending `[{role: "user", content: "follow up"}]` with no `session_id` and no prior turns means the server has no context. The model will respond as if it's the first message ever. This is the most common "multi-turn chat is broken" bug — fix by switching to Pattern A or B above.
 
 **Model binding:** the model is fixed at session creation. The `model` field in subsequent requests through that session is **ignored at the SDK layer** but echoed in the response. If you need a different model, create a new session.
 
@@ -505,7 +511,7 @@ The protocol is the Anthropic protocol — these are implementation limits, not 
 5. **Session timeout** is 30 min default. If your tool execution takes longer than that, the resume request will 404. Move long-running work to async background and respond fast to Conduit.
 6. **Thinking blocks filtered.** If you specifically need extended-thinking output, it's stripped from the stream.
 7. **Hosted-tool `allowed_domains` / `blocked_domains` / `max_uses` not yet wired through.** Conduit accepts them on the request (schema validation passes) but doesn't propagate them to the SDK. The SDK uses its own defaults.
-8. **Hosted-only sessions can't be reused.** Server tears them down after the response. Each hosted-only request is independent; the `x-conduit-session-id` header is informational only.
+8. **Hosted-only sessions ARE reusable now** (was previously a limitation). The `x-conduit-session-id` header from a hosted-tool response can be reused on follow-up turns to maintain conversation context — same Pattern B behavior as plain chat.
 9. **WebFetch doesn't render JavaScript.** Server-side fetch only — modern SPAs may return thin content.
 
 ---
@@ -923,7 +929,7 @@ curl -i -sS -X POST http://127.0.0.1:8765/v1/messages \
 19. **`content[]` is no longer a single-block array for hosted-tool turns.** If your client asserted `len(content) == 1` or used `content[0]` to mean "the answer", it'll break now — iterate by `type` instead. See `PASSTHROUGH_INTEGRATION.md` §7 for migration notes.
 20. **`include_thinking` doesn't change model behaviour, only forwarding.** The model thinks based on `effort` (and SDK defaults). Setting `include_thinking=true` on a simple-prompt low-effort request will yield no thinking blocks — the model just didn't think. See `THINKING_INTEGRATION.md` §1.
 21. **Thinking blocks come with a `signature` field.** It's an opaque cryptographic blob the SDK uses internally. Don't parse, reformat, or truncate it. If round-tripping the assistant message elsewhere, pass it verbatim.
-15. **Hosted-only requests don't need `x-conduit-session-id` handling.** The header is emitted but the session is torn down immediately after the response. Trying to reuse the id will return 404. Resume-style requests are only for custom-tool sessions.
+15. **Hosted-only requests now keep their session.** The header is emitted; the session stays alive (idle-evicted after 30 min by default). Reuse the id for multi-turn hosted-tool chats.
 16. **The model decides when to use hosted tools.** Declaring `web_search` is advisory. Sonnet/Haiku tend to over-use it (searching even for evergreen questions). Add a system prompt restriction if cost matters.
 
 ---
