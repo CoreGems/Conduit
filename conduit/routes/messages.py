@@ -167,7 +167,12 @@ async def _collect_tool_message(session, user_text, model) -> dict:
         "content": [],
         "stop_reason": "end_turn",
         "stop_sequence": None,
-        "usage": {"input_tokens": 0, "output_tokens": 0},
+        "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        },
     }
     blocks: dict[int, dict] = {}
 
@@ -178,7 +183,10 @@ async def _collect_tool_message(session, user_text, model) -> dict:
             m = data["message"]
             msg["id"] = m.get("id", msg["id"])
             msg["model"] = m.get("model", model)
-            msg["usage"]["input_tokens"] = (m.get("usage") or {}).get("input_tokens", 0)
+            u = m.get("usage") or {}
+            msg["usage"]["input_tokens"] = u.get("input_tokens", 0)
+            msg["usage"]["cache_creation_input_tokens"] = u.get("cache_creation_input_tokens", 0)
+            msg["usage"]["cache_read_input_tokens"] = u.get("cache_read_input_tokens", 0)
         elif t == "content_block_start":
             idx = data["index"]
             blocks[idx] = dict(data["content_block"])
@@ -220,6 +228,10 @@ async def _collect_tool_message(session, user_text, model) -> dict:
             u = data.get("usage") or {}
             if "output_tokens" in u:
                 msg["usage"]["output_tokens"] = u["output_tokens"]
+            if "cache_creation_input_tokens" in u:
+                msg["usage"]["cache_creation_input_tokens"] = u["cache_creation_input_tokens"]
+            if "cache_read_input_tokens" in u:
+                msg["usage"]["cache_read_input_tokens"] = u["cache_read_input_tokens"]
         # message_stop ends the iteration via stream_tool_events itself
 
     msg["content"] = [blocks[i] for i in sorted(blocks.keys())]

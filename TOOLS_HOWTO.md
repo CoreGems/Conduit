@@ -296,9 +296,8 @@ Transitions:
 
 ## Phased rollout
 
-1. **Phase 1 — probe** (1 hour). Write `scratch/sdk_tool_probe.py` that defines one `@tool` handler, queries Claude with a tool-requiring prompt, and prints every event/argument the SDK exposes. Answer open questions #1–3.
-2. **Phase 2 — single-tool, single-call** (half day). Implement bridge + auto session + resume for one tool, no parallelism, no timeout yet. Pass tests 1, 2, 6.
-3. **Phase 3 — parallel + error paths** (half day). Multiple tool_uses per turn, unknown-id rejection, timeout sweeper. Pass tests 3, 4, 5.
-4. **Phase 4 — compat parity** (1 hour). Run the official `anthropic` SDK's tool-use flow against Conduit. Pass test 7. Add `tool_choice` if time.
-
-Total estimate: ~1.5 days of focused work, gated by probe findings.
+1. **Phase 1 — probe** (1 hour). Write `scratch/sdk_tool_probe.py` that defines one `@tool` handler, queries Claude with a tool-requiring prompt, and prints every event/argument the SDK exposes. Answer open questions #1–3. ✅ Done.
+2. **Phase 2 — single-tool, single-call** (half day). Implement bridge + auto session + resume for one tool. ✅ Done.
+3. **Phase 2.5 — multi-cycle** (free, already worked). The pump-stays-alive design naturally supports N sequential `tool_use → tool_result → tool_use → ... → end_turn` cycles within one user turn. Pinned by `tests/test_multicycle_tools.py`. See AGENTIC_INTEGRATION.md §5.6.
+4. **Phase 3 — parallel + tool_choice** (half day). Parallel `tool_use` blocks in a single message (per-name FIFO is in place, just needs end-to-end test). Wire `tool_choice` to the SDK if there's a way.
+5. **Phase 4 — compat parity** (1 hour). Run the official `anthropic` SDK's tool-use flow against Conduit. ✅ Done.

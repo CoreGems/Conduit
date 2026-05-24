@@ -18,9 +18,9 @@ read the rest of the docs to build a working integration.
 | Streaming format | Server-Sent Events (`text/event-stream`) |
 | Conduit-specific extensions | `session_id` field, `effort` field, `include_thinking` field, `x-conduit-session-id` response header |
 | Drop-in OK | Yes — pointing the official `anthropic` SDK at the base URL works for chat *and* streaming. For Conduit-only fields like `effort` / `include_thinking`, use `extra_body={...}` |
-| Tool support | **Phase 2**: single-tool, single-call per turn. Parallel/sequential calls not yet supported. |
+| Tool support | Custom tools (pause/resume) and hosted server tools (no pause). **Sequential multi-cycle** within one user turn is supported — see §5.6. Parallel `tool_use` blocks in a single message work in principle (per-name FIFO id queue) but not exhaustively tested. |
 | Thinking budget | `effort: "low" \| "medium" \| "high" \| "xhigh" \| "max"` — Conduit extension, bound at session creation. See §4.4 and `EFFORT_INTEGRATION.md` for the deep dive. |
-| Hosted server tools | `WebSearch` and `WebFetch` — declare Anthropic-style in `tools[]`, SDK executes internally. Response carries `server_tool_use` + `web_search_tool_result` / `web_fetch_tool_result` blocks alongside the final `text`, all with `stop_reason: end_turn`. **No pause/resume**. See §5.6 and `WEBSEARCH_INTEGRATION.md` / `PASSTHROUGH_INTEGRATION.md`. |
+| Hosted server tools | `WebSearch` and `WebFetch` — declare Anthropic-style in `tools[]`, SDK executes internally. Response carries `server_tool_use` + `web_search_tool_result` / `web_fetch_tool_result` blocks alongside the final `text`, all with `stop_reason: end_turn`. **No pause/resume**. See §5.7 and `WEBSEARCH_INTEGRATION.md` / `PASSTHROUGH_INTEGRATION.md`. |
 
 ---
 
@@ -63,7 +63,7 @@ The chat endpoint. Mirrors Anthropic's `/v1/messages` exactly, plus `session_id`
 | `stream` | bool | ❌ default `false` | `true` → SSE; `false` → single JSON object. |
 | `temperature` | float | ❌ | Standard Anthropic. |
 | `stop_sequences` | string[] | ❌ | Standard Anthropic. |
-| `tools` | `ToolUnionParam[]` | ❌ | Mix of custom function tools and/or hosted server tools (WebSearch/WebFetch). Conduit splits internally. See §5 (custom pause/resume) and §5.6 (hosted, no pause). |
+| `tools` | `ToolUnionParam[]` | ❌ | Mix of custom function tools and/or hosted server tools (WebSearch/WebFetch). Conduit splits internally. See §5.2 (custom single-cycle), §5.6 (custom multi-cycle), §5.7 (hosted, no pause). |
 | `tool_choice` | object | ❌ | Accepted but **currently ignored** in Phase 2. |
 | **`effort`** | `"low" \| "medium" \| "high" \| "xhigh" \| "max"` | ❌ | **Conduit extension.** Maps to the Agent SDK's `effort` field — controls thinking budget. Bound at session creation; ignored on subsequent turns of a stateful session. |
 | **`include_thinking`** | bool | ❌ default `false` | **Conduit extension.** When true, response includes `thinking` content blocks (Anthropic-canonical). The model thinks regardless; this flag only controls forwarding. Bound at session creation. See `THINKING_INTEGRATION.md`. |
@@ -303,6 +303,32 @@ You can also send `session_id` **and** full history — Conduit reads only the l
 
 **Pure-stateless WITHOUT history doesn't work.** Sending `[{role: "user", content: "follow up"}]` with no `session_id` and no prior turns means the server has no context. The model will respond as if it's the first message ever. This is the most common "multi-turn chat is broken" bug — fix by switching to Pattern A or B above.
 
+### 4.2a Prompt caching (latency)
+
+Conduit does **not** propagate Anthropic's `cache_control: {type: "ephemeral"}` field on message blocks — the text-extraction layer strips it. But it doesn't matter for the common case, because **the Agent SDK auto-caches the session's context aggressively** (uses Anthropic's 1-hour ephemeral cache tier by default — longer than the standard 5-min cache). Concretely:
+
+- The first call on a session writes the system prompt + SDK-internal context to cache (`usage.cache_creation_input_tokens` reports how much).
+- Every subsequent call on the **same session** reads from that cache (`usage.cache_read_input_tokens` reports how much). Big latency win on repeated requests with the same system prompt.
+
+**Implication for choosing a pattern:**
+
+| | Cache hit rate |
+|---|---|
+| Pattern A (no `session_id`, full history each request) | **0%** — new ephemeral session per request, cache cold every time. |
+| Pattern B (reuse `session_id`) | **High** — system prompt + context cached on turn 1, hits on turns 2+. |
+
+If you're sending the same ≥600-char system prompt on every paste/request and care about latency, **switch to Pattern B**. The `usage` block in every response now carries `cache_creation_input_tokens` and `cache_read_input_tokens` so you can observe cache effectiveness directly.
+
+Example (probe numbers, Haiku, 600-char system prompt, same session reused):
+
+```
+Turn 1 (cold):  input=9  cache_create=744   cache_read=37918  output=373
+Turn 2:         input=9  cache_create=384   cache_read=38662  output=232
+Turn 3:         input=9  cache_create=245   cache_read=39046  output=245
+```
+
+(The 37K-token `cache_read` from turn 1 is the SDK's internal Claude Code context — it was warm from a prior unrelated session in the same hour. Your own system prompt is the 744 tokens cached on turn 1.)
+
 **Model binding:** the model is fixed at session creation. The `model` field in subsequent requests through that session is **ignored at the SDK layer** but echoed in the response. If you need a different model, create a new session.
 
 **Effort binding:** identical rule. `effort` is read once when the session is created and applies to every turn through that session. Sending a different `effort` on a follow-up request is silently ignored.
@@ -438,7 +464,7 @@ POST /v1/messages
 - After the final `stop_reason: "end_turn"` you may either:
   - Let it die by idle timeout (default 30 min), or
   - `DELETE /v1/sessions/{id}` to clean up immediately, or
-  - **Reuse it for another turn** — see §6.4 limitation note before relying on this.
+  - **Reuse it for another user turn** (Pattern B) — works fine; the SDK retains conversation state.
 
 ### 5.5 Errors specific to resume
 
@@ -450,7 +476,105 @@ POST /v1/messages
 | 400 | `session_id` is for a non-tool session |
 | 404 | `session_id` not found (likely timed out) — start over |
 
-### 5.6 Hosted tools (WebSearch / WebFetch) — one request, no pause
+### 5.6 Multi-cycle tool use (N sequential tool calls in one turn)
+
+The model is allowed to chain custom tool calls within a single user turn — e.g. `list_topics → tool_result → topic_coverage → tool_result → text → end_turn`. Each pause is its own HTTP round-trip but they all share the same `session_id`.
+
+**The protocol is identical to §5.2 single-cycle — just repeat until `stop_reason: end_turn`.** No special "cycle number" header, no per-cycle session_id rotation. Every cycle:
+
+1. Server response has `stop_reason: "tool_use"` and a `tool_use` block in `content[]`
+2. Client executes the tool, builds the next request:
+   - Append the assistant's last `content[]` (the `tool_use` block) to `messages[]`
+   - Append a new user message with a `tool_result` block carrying the *current* cycle's `tool_use_id`
+   - Send with the **same** `session_id` from the previous response's header
+3. Loop until the server returns `stop_reason: "end_turn"`
+
+Each cycle's `tool_use.id` is **unique** — don't reuse them across cycles, and don't reuse one for the wrong cycle (server returns 400 `unknown tool_use_id`).
+
+**Cycle 2+ request body shape:**
+
+```json
+{
+  "model": "...",
+  "max_tokens": 600,
+  "session_id": "<same uuid from cycle 1's header>",
+  "tools": [/* same tools list */],
+  "messages": [
+    {"role": "user",      "content": "<original user question>"},
+    {"role": "assistant", "content": [/* tool_use block from cycle 1, verbatim */]},
+    {"role": "user",      "content": [
+      {"type": "tool_result", "tool_use_id": "<cycle 1's id>", "content": "<cycle 1's result>"}
+    ]},
+    {"role": "assistant", "content": [/* tool_use block from cycle 2, verbatim */]},
+    {"role": "user",      "content": [
+      {"type": "tool_result", "tool_use_id": "<cycle 2's id>", "content": "<cycle 2's result>"}
+    ]}
+  ]
+}
+```
+
+Server inspects only the trailing `tool_result` block in `messages[-1].content`. The earlier turns are decorative for upstream-Anthropic parity (and required by pydantic's schema validation), but the server doesn't need to re-read them — the session's SDK conversation state already remembers everything.
+
+**Python recipe (Pattern A-style — works for both single and multi cycle):**
+
+```python
+import httpx, json
+
+URL = "http://127.0.0.1:8765"
+MODEL = "claude-haiku-4-5-20251001"
+TOOLS = [...]
+
+def execute_tool(name, args):
+    ...  # your tool implementations
+    return "<result string>"
+
+history = [{"role": "user", "content": "<user prompt>"}]
+sid = None
+
+# Initial request
+r = httpx.post(URL + "/v1/messages", json={
+    "model": MODEL, "max_tokens": 600,
+    "tools": TOOLS,
+    "system": "...",
+    "messages": history,
+}, timeout=180)
+sid = r.headers["x-conduit-session-id"]
+msg = r.json()
+
+# Loop while the model wants more tools
+while msg["stop_reason"] == "tool_use":
+    tu = next(b for b in msg["content"] if b["type"] == "tool_use")
+    result = execute_tool(tu["name"], tu["input"])
+
+    history.append({"role": "assistant", "content": msg["content"]})
+    history.append({"role": "user", "content": [{
+        "type": "tool_result",
+        "tool_use_id": tu["id"],
+        "content": result,
+    }]})
+
+    r = httpx.post(URL + "/v1/messages", json={
+        "model": MODEL, "max_tokens": 600,
+        "tools": TOOLS,
+        "session_id": sid,
+        "messages": history,
+    }, timeout=180)
+    msg = r.json()
+
+# stop_reason is now end_turn; msg["content"] has the final text
+final_text = "".join(b["text"] for b in msg["content"] if b["type"] == "text")
+httpx.delete(URL + f"/v1/sessions/{sid}", timeout=10)
+```
+
+**Streaming the resume cycles.** Same as §3.4 single-cycle, just repeated. Each cycle's SSE response starts with `message_start` and ends with `message_stop`. If that cycle ended with another `tool_use`, the `message_delta` carries `stop_reason: "tool_use"` and you start cycle N+1; if it carries `stop_reason: "end_turn"` you're done. The cycle 2+ stream looks identical to cycle 1's stream, with possibly different content (text-then-tool_use, or just-tool_use, or just-text depending on what the model chose).
+
+**Limits in current implementation:**
+- No hard cap on cycles within a turn (subject to the 30-min idle session timeout).
+- Parallel tool calls in one cycle (model emitting two `tool_use` blocks in a single message) work in principle (per-name FIFO id queue is in place) but aren't exhaustively tested. Constrain via prompting if you want strict serialization.
+
+See `scripts/multicycle_demo.py` for a runnable end-to-end example.
+
+### 5.7 Hosted tools (WebSearch / WebFetch) — one request, no pause
 
 For hosted server tools, the protocol simplifies dramatically. Declare them in `tools[]` and send **one** request:
 
@@ -504,8 +628,8 @@ For the deep dive on the response shape — every block type, how to parse `*_to
 
 The protocol is the Anthropic protocol — these are implementation limits, not wire incompatibilities. The client doesn't need workarounds, just awareness.
 
-1. **Single tool call per turn.** If the model tries to emit two `tool_use` blocks in one turn (parallel tool calling), behavior is undefined in Phase 2. Constrain your tool list / prompting so the model picks one at a time.
-2. **Single round per session.** Phase 2 is tested with one pause/resume cycle then `end_turn`. Multi-turn conversations on the same tool session (user → tool_use → result → text → user → ... again) are not yet exercised.
+1. **Parallel tool calls in one cycle.** If the model emits two `tool_use` blocks in a single message (parallel tool calling), the per-name FIFO id queue handles it in principle but it's not exhaustively tested. Constrain via prompting if you need strict serialization.
+2. ~~Single round per session.~~ **Supported.** N sequential `tool_use → tool_result` cycles within one user turn work — see §5.6 for the protocol. Multi-user-turn conversations on the same session (one tool sequence completes → user asks another question → another tool sequence) also work.
 3. **`tool_choice` ignored.** You can send it; it doesn't constrain the model.
 4. **Per-session model lock** — see §4.2.
 5. **Session timeout** is 30 min default. If your tool execution takes longer than that, the resume request will 404. Move long-running work to async background and respond fast to Conduit.
@@ -924,13 +1048,14 @@ curl -i -sS -X POST http://127.0.0.1:8765/v1/messages \
 12. **`effort` values are case-sensitive lowercase.** `"High"` or `"HIGH"` → 422 validation error.
 13. **Setting `effort` on a turn through an existing session does nothing.** Effort is locked at session creation, same rule as `model`. To change effort mid-conversation, create a new session.
 14. **Hosted-tool `name` is a pydantic literal.** Must be exactly `"web_search"` (lowercase) for any `web_search_*` type, exactly `"web_fetch"` for any `web_fetch_*` type. Renaming (`"WebSearch"`, `"web_search_sdk"`, etc.) returns 422 — schema validation rejects it before Conduit's hosted-vs-custom splitter ever runs.
-17. **Hosted tools emit `server_tool_use`, NOT `tool_use`.** Client-pause-style `tool_use` blocks are exclusive to custom function tools (where you must execute and send `tool_result`). Hosted blocks carry `type: "server_tool_use"` so you can distinguish them at the type level. The paired result block is `type: "web_search_tool_result"` or `"web_fetch_tool_result"`.
-18. **`*_tool_result.content` is a string, not a list of blocks.** It includes embedded JSON `Links: [{title, url}]` plus a textual summary. The format is the SDK's; parse markdown citations from the trailing `text` block for stability. See `PASSTHROUGH_INTEGRATION.md` §4.
-19. **`content[]` is no longer a single-block array for hosted-tool turns.** If your client asserted `len(content) == 1` or used `content[0]` to mean "the answer", it'll break now — iterate by `type` instead. See `PASSTHROUGH_INTEGRATION.md` §7 for migration notes.
-20. **`include_thinking` doesn't change model behaviour, only forwarding.** The model thinks based on `effort` (and SDK defaults). Setting `include_thinking=true` on a simple-prompt low-effort request will yield no thinking blocks — the model just didn't think. See `THINKING_INTEGRATION.md` §1.
-21. **Thinking blocks come with a `signature` field.** It's an opaque cryptographic blob the SDK uses internally. Don't parse, reformat, or truncate it. If round-tripping the assistant message elsewhere, pass it verbatim.
-15. **Hosted-only requests now keep their session.** The header is emitted; the session stays alive (idle-evicted after 30 min by default). Reuse the id for multi-turn hosted-tool chats.
-16. **The model decides when to use hosted tools.** Declaring `web_search` is advisory. Sonnet/Haiku tend to over-use it (searching even for evergreen questions). Add a system prompt restriction if cost matters.
+15. **Hosted tools emit `server_tool_use`, NOT `tool_use`.** Client-pause-style `tool_use` blocks are exclusive to custom function tools (where you must execute and send `tool_result`). Hosted blocks carry `type: "server_tool_use"` so you can distinguish them at the type level. The paired result block is `type: "web_search_tool_result"` or `"web_fetch_tool_result"`.
+16. **`*_tool_result.content` is a string, not a list of blocks.** It includes embedded JSON `Links: [{title, url}]` plus a textual summary. The format is the SDK's; parse markdown citations from the trailing `text` block for stability. See `PASSTHROUGH_INTEGRATION.md` §4.
+17. **`content[]` is no longer a single-block array for hosted-tool turns.** If your client asserted `len(content) == 1` or used `content[0]` to mean "the answer", it'll break now — iterate by `type` instead. See `PASSTHROUGH_INTEGRATION.md` §7 for migration notes.
+18. **`include_thinking` doesn't change model behaviour, only forwarding.** The model thinks based on `effort` (and SDK defaults). Setting `include_thinking=true` on a simple-prompt low-effort request will yield no thinking blocks — the model just didn't think. See `THINKING_INTEGRATION.md` §1.
+19. **Thinking blocks come with a `signature` field.** It's an opaque cryptographic blob the SDK uses internally. Don't parse, reformat, or truncate it. If round-tripping the assistant message elsewhere, pass it verbatim.
+20. **Hosted-only requests keep their session.** The header is emitted; the session stays alive (idle-evicted after 30 min by default). Reuse the id for multi-turn hosted-tool chats.
+21. **The model decides when to use hosted tools.** Declaring `web_search` is advisory. Sonnet/Haiku tend to over-use it (searching even for evergreen questions). Add a system prompt restriction if cost matters.
+22. **Multi-cycle resume reuses the same `session_id`.** Every cycle (initial, resume 1, resume 2, ...) goes to the *same* server session. Don't capture a new id from each response — the server echoes the original one. Each cycle's `tool_use_id` is unique, but `session_id` stays constant. See §5.6.
 
 ---
 
@@ -975,10 +1100,19 @@ curl -i -sS -X POST http://127.0.0.1:8765/v1/messages \
   - Your `type` didn't match a `web_search_*` or `web_fetch_*` prefix (typo? wrong version?). The detector matches by prefix; if it doesn't match, the tool falls through to the custom path and Conduit builds a bridge nobody will satisfy.
 - Run `scripts/websearch_test.py` to confirm canonical declarations work on your installation.
 
-### 10.9 Response is slow when you declared web tools
+### 10.10 Response is slow when you declared web tools
 - Each hosted-tool invocation adds real network latency (~3-6s for search, ~2-5s for fetch). Chains can run 10s+. This is the tool calls, not Conduit overhead.
 - Use a tighter `system` prompt to discourage unnecessary searches.
 - For latency-critical UX, don't declare hosted tools by default — opt in per-request.
+
+### 10.11 Multi-cycle tool use: model keeps emitting `tool_use` and never reaches `end_turn`
+- The model is choosing to chain more tool calls. This is intentional behavior — see §5.6. Loop your client until `stop_reason == "end_turn"`, capping `max_cycles` for safety.
+- If the model is looping unproductively (calling the same tool repeatedly), tighten the system prompt to say what "done" looks like.
+- If a tool returns a permanent error (e.g. "city not found"), encode it as `{"type": "tool_result", "tool_use_id": ..., "is_error": true, "content": "..."}` so the model knows to stop retrying.
+
+### 10.12 `400 tool_result requires session_id` on resume
+- Your resume request has a `tool_result` block in the last user message, but the request body has no `session_id`. Capture `x-conduit-session-id` from the initial response's headers and pass it on every resume.
+- If you're in a multi-cycle scenario (§5.6), use the same `session_id` for every cycle — don't try to capture a new id from each response.
 
 ---
 
@@ -988,7 +1122,7 @@ Conduit is pre-1.0 and tracks the Anthropic API loosely:
 
 - New Anthropic content-block types: forwarded if they pass through the SDK's `StreamEvent.event` dict.
 - Renamed/restructured Anthropic fields: server-side schema (re-exported from the `anthropic` Python package) updates with that package's version.
-- Phase 3+ will add: parallel tool calls, multi-turn tool sessions, `tool_choice` enforcement, `CONDUIT_TOOL_RESULT_TIMEOUT_S` enforcement, persistent (Redis/SQLite) session store.
+- Future work: exhaustive testing of parallel `tool_use` blocks in one message, `tool_choice` enforcement, `CONDUIT_TOOL_RESULT_TIMEOUT_S` enforcement, hosted-tool `allowed_domains`/`blocked_domains` propagation, persistent (Redis/SQLite) session store.
 
 ---
 
@@ -1002,7 +1136,8 @@ For an agent integrating this for the first time:
 - [ ] If using custom tools: declare them, send initial request, capture `x-conduit-session-id` header and the `tool_use` block's `id`.
 - [ ] Execute the tool client-side.
 - [ ] Send resume request with `session_id`, `tools` (same list), and a trailing user message whose content is `[{"type":"tool_result","tool_use_id":<id>,"content":<your result>}]`.
+- [ ] **For multi-cycle tools (§5.6):** loop while `stop_reason == "tool_use"`, reusing the same `session_id` and appending `assistant{tool_use}` + `user{tool_result}` pairs to `messages[]` each cycle. Cap `max_cycles` for safety.
 - [ ] Receive the final answer with `stop_reason: "end_turn"`.
 - [ ] Optionally `DELETE /v1/sessions/<id>`.
-- [ ] If using hosted tools (`web_search` / `web_fetch`): declare them with `{"type": "web_search_20250305", "name": "web_search"}` (or shorthand `{"name": "WebSearch"}`); send a single request asking a current-events question; expect `stop_reason: "end_turn"`, plain text with citations inline, **no** `tool_use` blocks in `content[]`.
-- [ ] Consider running `scripts/websearch_test.py` to verify all four hosted-tool scenarios (WebSearch alone, WebFetch alone, both together, mixed hosted+custom).
+- [ ] If using hosted tools (`web_search` / `web_fetch`): declare them with the canonical `{"type": "web_search_20250305", "name": "web_search"}` shape (the `name` field is a pydantic literal — `"WebSearch"` etc. will 422); send a single request asking a current-events question; expect `stop_reason: "end_turn"`, `server_tool_use` + `web_search_tool_result` + `text` blocks in `content[]`, **no** client-pause-style `tool_use` blocks.
+- [ ] Consider running `scripts/websearch_test.py` and `scripts/multicycle_demo.py` to verify both flows end-to-end on your installation.

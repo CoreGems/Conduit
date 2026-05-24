@@ -147,6 +147,8 @@ async def collect_non_streaming(
     stop_reason: str | None = None
     input_tokens = 0
     output_tokens = 0
+    cache_creation_input_tokens = 0
+    cache_read_input_tokens = 0
 
     async for msg in session.client.receive_response():
         if isinstance(msg, AssistantMessage):
@@ -170,9 +172,13 @@ async def collect_non_streaming(
                 usage = ev.get("usage") or {}
                 output_tokens = int(usage.get("output_tokens", output_tokens))
                 input_tokens = int(usage.get("input_tokens", input_tokens))
+                cache_creation_input_tokens = int(usage.get("cache_creation_input_tokens", cache_creation_input_tokens))
+                cache_read_input_tokens = int(usage.get("cache_read_input_tokens", cache_read_input_tokens))
             elif ev.get("type") == "message_start":
                 usage = (ev.get("message") or {}).get("usage") or {}
                 input_tokens = int(usage.get("input_tokens", input_tokens))
+                cache_creation_input_tokens = int(usage.get("cache_creation_input_tokens", cache_creation_input_tokens))
+                cache_read_input_tokens = int(usage.get("cache_read_input_tokens", cache_read_input_tokens))
         elif isinstance(msg, ResultMessage):
             session.message_count += 1
             stop_reason = stop_reason or getattr(msg, "stop_reason", None) or "end_turn"
@@ -186,7 +192,12 @@ async def collect_non_streaming(
         "content": content_blocks,
         "stop_reason": stop_reason or "end_turn",
         "stop_sequence": None,
-        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_creation_input_tokens": cache_creation_input_tokens,
+            "cache_read_input_tokens": cache_read_input_tokens,
+        },
     }
 
 
