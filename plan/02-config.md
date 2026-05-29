@@ -61,7 +61,7 @@ Remove-Item env:CONDUIT_PORT
 `.env` file at project root also works:
 ```
 CONDUIT_PORT=9000
-CONDUIT_DEFAULT_MODEL=claude-opus-4-7
+CONDUIT_DEFAULT_MODEL=claude-opus-4-8
 ```
 
 ## Depends on

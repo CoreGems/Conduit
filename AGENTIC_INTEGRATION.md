@@ -18,7 +18,7 @@ read the rest of the docs to build a working integration.
 | Streaming format | Server-Sent Events (`text/event-stream`) |
 | Conduit-specific extensions | `session_id` field, `effort` field, `include_thinking` field, `x-conduit-session-id` response header |
 | Drop-in OK | Yes — pointing the official `anthropic` SDK at the base URL works for chat *and* streaming. For Conduit-only fields like `effort` / `include_thinking`, use `extra_body={...}` |
-| Tool support | Custom tools (pause/resume) and hosted server tools (no pause). **Sequential multi-cycle** within one user turn is supported — see §5.6. Parallel `tool_use` blocks in a single message work in principle (per-name FIFO id queue) but not exhaustively tested. |
+| Tool support | Custom tools (pause/resume) and hosted server tools (no pause). **Sequential multi-cycle** AND **parallel** tool calls both supported. See §5.6 (sequential) and §5.8 (parallel — N tool_use blocks in one message, N tool_results in one resume). |
 | Thinking budget | `effort: "low" \| "medium" \| "high" \| "xhigh" \| "max"` — Conduit extension, bound at session creation. See §4.4 and `EFFORT_INTEGRATION.md` for the deep dive. |
 | Hosted server tools | `WebSearch` and `WebFetch` — declare Anthropic-style in `tools[]`, SDK executes internally. Response carries `server_tool_use` + `web_search_tool_result` / `web_fetch_tool_result` blocks alongside the final `text`, all with `stop_reason: end_turn`. **No pause/resume**. See §5.7 and `WEBSEARCH_INTEGRATION.md` / `PASSTHROUGH_INTEGRATION.md`. |
 
@@ -570,7 +570,6 @@ httpx.delete(URL + f"/v1/sessions/{sid}", timeout=10)
 
 **Limits in current implementation:**
 - No hard cap on cycles within a turn (subject to the 30-min idle session timeout).
-- Parallel tool calls in one cycle (model emitting two `tool_use` blocks in a single message) work in principle (per-name FIFO id queue is in place) but aren't exhaustively tested. Constrain via prompting if you want strict serialization.
 
 See `scripts/multicycle_demo.py` for a runnable end-to-end example.
 
@@ -622,13 +621,79 @@ For the full hosted-tool reference (cost/latency, all accepted JSON shapes, debu
 
 For the deep dive on the response shape — every block type, how to parse `*_tool_result.content`, how the SSE stream interleaves the new blocks, and what client-side code needs to change — see **`PASSTHROUGH_INTEGRATION.md`**.
 
+### 5.8 Parallel custom tool calls (N tool_use blocks in one message)
+
+When the prompt invites it (e.g. "look up X and Y at the same time"), the model can emit **multiple `tool_use` blocks in a single message**. The whole batch shares one `message_start`…`message_stop` span and one `stop_reason: "tool_use"`. The client returns **all** `tool_result` blocks in a single user message on the resume.
+
+**Wire shape — one cycle, N parallel calls:**
+
+```json
+// SERVER → CLIENT (turn 1 body)
+{
+  "stop_reason": "tool_use",
+  "content": [
+    {"type": "tool_use", "id": "toolu_01...", "name": "get_weather", "input": {"city": "Paris"}},
+    {"type": "tool_use", "id": "toolu_02...", "name": "get_weather", "input": {"city": "Tokyo"}}
+  ]
+}
+
+// CLIENT → SERVER (resume body)
+{
+  ...,
+  "session_id": "...",
+  "messages": [
+    {"role": "user",      "content": "<original prompt>"},
+    {"role": "assistant", "content": [/* both tool_use blocks, verbatim */]},
+    {"role": "user",      "content": [
+      {"type": "tool_result", "tool_use_id": "toolu_01...", "content": "72F sunny in Paris"},
+      {"type": "tool_result", "tool_use_id": "toolu_02...", "content": "60F cloudy in Tokyo"}
+    ]}
+  ]
+}
+```
+
+Two implementation notes worth knowing about (don't affect what you send):
+
+1. **The Agent SDK invokes `@tool` handlers serially even when the model emits them in parallel.** So when the client returns N results at once, only the first id has a live Future at delivery time. Conduit's `deferred_results` table stashes the rest; each handler picks up its result when it eventually fires. The end-to-end semantics are still "all results delivered in one resume → final answer in one response."
+2. **`tool_use_id`s are unique within the batch** (toolu_01..., toolu_02...). Send each `tool_result` with the matching id; order in the `content` array doesn't matter.
+
+**Python recipe** — same loop as multi-cycle (§5.6), just handles the N>1 case naturally:
+
+```python
+while msg["stop_reason"] == "tool_use":
+    tool_uses = [b for b in msg["content"] if b["type"] == "tool_use"]
+    # Execute all of them (concurrently if your tools are async-friendly)
+    tool_results = [
+        {"type": "tool_result",
+         "tool_use_id": tu["id"],
+         "content": execute_tool(tu["name"], tu["input"])}
+        for tu in tool_uses
+    ]
+    history.append({"role": "assistant", "content": msg["content"]})
+    history.append({"role": "user", "content": tool_results})    # ← N results in one message
+    r = httpx.post(URL + "/v1/messages", json={
+        "model": MODEL, "max_tokens": 600, "tools": TOOLS,
+        "session_id": sid, "messages": history,
+    })
+    msg = r.json()
+```
+
+If you want to **disable** parallel tool calling and force serial, anchor with a system prompt:
+
+```python
+"system": "When multiple tools are needed, call them one at a time and "
+          "wait for each result before deciding the next call."
+```
+
+(Anthropic's `tool_choice: {disable_parallel_tool_use: true}` is parsed but currently ignored by Conduit — see §6.)
+
 ---
 
 ## 6. Limitations (Phase 2)
 
 The protocol is the Anthropic protocol — these are implementation limits, not wire incompatibilities. The client doesn't need workarounds, just awareness.
 
-1. **Parallel tool calls in one cycle.** If the model emits two `tool_use` blocks in a single message (parallel tool calling), the per-name FIFO id queue handles it in principle but it's not exhaustively tested. Constrain via prompting if you need strict serialization.
+1. ~~Parallel tool calls in one cycle.~~ **Supported.** See §5.8.
 2. ~~Single round per session.~~ **Supported.** N sequential `tool_use → tool_result` cycles within one user turn work — see §5.6 for the protocol. Multi-user-turn conversations on the same session (one tool sequence completes → user asks another question → another tool sequence) also work.
 3. **`tool_choice` ignored.** You can send it; it doesn't constrain the model.
 4. **Per-session model lock** — see §4.2.
@@ -1122,7 +1187,7 @@ Conduit is pre-1.0 and tracks the Anthropic API loosely:
 
 - New Anthropic content-block types: forwarded if they pass through the SDK's `StreamEvent.event` dict.
 - Renamed/restructured Anthropic fields: server-side schema (re-exported from the `anthropic` Python package) updates with that package's version.
-- Future work: exhaustive testing of parallel `tool_use` blocks in one message, `tool_choice` enforcement, `CONDUIT_TOOL_RESULT_TIMEOUT_S` enforcement, hosted-tool `allowed_domains`/`blocked_domains` propagation, persistent (Redis/SQLite) session store.
+- Future work: `tool_choice` enforcement, `CONDUIT_TOOL_RESULT_TIMEOUT_S` enforcement, hosted-tool `allowed_domains`/`blocked_domains` propagation, persistent (Redis/SQLite) session store.
 
 ---
 

@@ -7,12 +7,16 @@ prints the thinking trace alongside the final answer so you can verify the
 
 Usage:
     conda run -n conduit --no-capture-output python scripts/thinking_demo.py
-    conda run -n conduit --no-capture-output python scripts/thinking_demo.py --model claude-opus-4-7 --effort xhigh
+    conda run -n conduit --no-capture-output python scripts/thinking_demo.py --model claude-opus-4-8 --effort xhigh
     conda run -n conduit --no-capture-output python scripts/thinking_demo.py --prompt "your custom question"
+
+Model defaults to $CONDUIT_MODEL if set, else Haiku. A more capable model with
+--effort high/xhigh produces richer thinking traces.
 """
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 
@@ -57,8 +61,9 @@ def ask(url: str, model: str, effort: str | None, prompt: str, include_thinking:
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--url", default="http://127.0.0.1:8765", help="Conduit base URL")
-    p.add_argument("--model", default="claude-haiku-4-5-20251001",
-                   help="Model to use (try claude-opus-4-7 with --effort xhigh for richer thinking)")
+    p.add_argument("--model", default=os.environ.get("CONDUIT_MODEL", "claude-haiku-4-5-20251001"),
+                   help="Model to use. Defaults to $CONDUIT_MODEL or Haiku. Try a more "
+                        "capable model with --effort xhigh for richer thinking.")
     p.add_argument("--effort", default=None,
                    choices=[None, "low", "medium", "high", "xhigh", "max"],
                    help="Thinking budget level (controls how much the model thinks)")

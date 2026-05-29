@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 
@@ -119,7 +120,8 @@ def print_cycle(label: str, msg: dict, sid: str | None, dt: float) -> None:
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--url", default="http://127.0.0.1:8765")
-    p.add_argument("--model", default="claude-haiku-4-5-20251001")
+    p.add_argument("--model", default=os.environ.get("CONDUIT_MODEL", "claude-haiku-4-5-20251001"),
+                   help="Model to use. Defaults to $CONDUIT_MODEL or Haiku (cheapest).")
     p.add_argument("--question", default="How am I doing on warehouses? Be specific.")
     p.add_argument("--max-cycles", type=int, default=6)
     args = p.parse_args()

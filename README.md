@@ -155,6 +155,24 @@ All settings via env (`CONDUIT_*` prefix) or `.env` file:
 | `CONDUIT_SESSION_IDLE_TIMEOUT_S`  | `1800`                        | Sessions evicted after N idle seconds |
 | `CONDUIT_MAX_SESSIONS`            | `100`                         | Hard cap on concurrent sessions      |
 
+There are two more model knobs used outside the server process, for convenience:
+
+| Variable           | Used by                | Default                       |
+| ------------------ | ---------------------- | ----------------------------- |
+| `CONDUIT_MODEL`    | demo scripts (`scripts/*.py`) `--model` default | `claude-haiku-4-5-20251001` |
+| `CONDUIT_TEST_MODEL` | the pytest integration suite | `claude-haiku-4-5-20251001` |
+
+So to point everything at a newer model in one shot:
+
+```powershell
+$env:CONDUIT_DEFAULT_MODEL = "claude-opus-4-8"   # the server
+$env:CONDUIT_MODEL         = "claude-opus-4-8"   # the demo scripts
+$env:CONDUIT_TEST_MODEL    = "claude-opus-4-8"   # the test suite
+```
+
+(Scripts and tests default to Haiku independently of the server so casual local
+testing stays cheap even if you've set the server default to something pricier.)
+
 ## Tests
 
 ```powershell

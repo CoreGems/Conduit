@@ -57,6 +57,12 @@ class Session:
     pump_task: asyncio.Task | None = None
     pending_ids_by_name: dict[str, deque[str]] = field(default_factory=dict)
     pending_futures: dict[str, asyncio.Future] = field(default_factory=dict)
+    # Results delivered for tool_use_ids whose handler hasn't been called yet.
+    # Happens with parallel tool calls: the SDK calls @tool handlers serially,
+    # so when the client returns N tool_results at once only the first id has
+    # a live Future. Later ids get stashed here and consumed by their handler
+    # when it eventually fires.
+    deferred_results: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @property
     def is_tool_session(self) -> bool:
@@ -67,6 +73,19 @@ class Session:
         """True if the session uses the background pump (any tools, custom or hosted)."""
         return self.events_queue is not None
 
+    def is_pending_tool_use_id(self, tool_use_id: str) -> bool:
+        """True if `tool_use_id` is known to this session — either has a live
+        Future awaiting result, or has been observed in the stream and is
+        waiting for its handler to fire (parallel-tool case)."""
+        if tool_use_id in self.pending_futures:
+            return True
+        if tool_use_id in self.deferred_results:
+            return True
+        for q in self.pending_ids_by_name.values():
+            if tool_use_id in q:
+                return True
+        return False
+
     # --- Tool-use plumbing (called from the bridge + the streaming layer) ---
 
     def record_pending_id(self, name: str, tool_use_id: str) -> None:
@@ -75,13 +94,22 @@ class Session:
         self.pending_ids_by_name.setdefault(name, deque()).append(tool_use_id)
 
     async def await_tool_result(self, name: str, arg: dict) -> dict:
-        """Called from the MCP bridge handler. Parks the SDK loop until the
-        client returns a matching tool_result. Returns the SDK-shaped result."""
+        """Called from the MCP bridge handler. Returns the matching tool_result
+        immediately if the client has already delivered it (parallel-tool case),
+        otherwise parks the SDK loop until the client returns one."""
         q = self.pending_ids_by_name.get(name)
         if not q:
             return {"content": [{"type": "text", "text": f"[conduit] no pending tool_use_id for {name}"}]}
         tool_use_id = q.popleft()
 
+        # Fast path: client already delivered this id (e.g. parallel tools —
+        # client sent N results in one resume; only the first handler had a
+        # live Future at delivery time, the rest were stashed here).
+        deferred = self.deferred_results.pop(tool_use_id, None)
+        if deferred is not None:
+            return deferred
+
+        # Slow path: park on a Future for the client to deliver later.
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         self.pending_futures[tool_use_id] = fut
@@ -91,21 +119,29 @@ class Session:
             self.pending_futures.pop(tool_use_id, None)
 
     def deliver_tool_result(self, tool_use_id: str, content: Any) -> bool:
-        """Resolve the parked Future for `tool_use_id`. Returns True if delivered.
+        """Deliver a tool_result for `tool_use_id`. Returns True if accepted.
 
-        Accepts content as a string, list of content blocks, or any object
-        (stringified). Wraps it in the SDK's return shape.
+        Two paths:
+          * The handler already fired and is parked on a Future → resolve it.
+          * The handler hasn't been called yet (parallel-tool case: SDK invokes
+            handlers serially, so only the first id of a batch has a live Future
+            at the time the client returns N results) → stash in deferred_results
+            for the handler to find when it eventually pops its id.
         """
-        fut = self.pending_futures.get(tool_use_id)
-        if fut is None or fut.done():
-            return False
         if isinstance(content, str):
             payload = {"content": [{"type": "text", "text": content}]}
         elif isinstance(content, list):
             payload = {"content": content}
         else:
             payload = {"content": [{"type": "text", "text": str(content)}]}
-        fut.set_result(payload)
+
+        fut = self.pending_futures.get(tool_use_id)
+        if fut is not None and not fut.done():
+            fut.set_result(payload)
+            return True
+
+        # No live Future yet → stash. await_tool_result will consume it.
+        self.deferred_results[tool_use_id] = payload
         return True
 
 

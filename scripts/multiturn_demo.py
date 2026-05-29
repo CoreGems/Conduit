@@ -36,6 +36,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 
@@ -192,8 +193,8 @@ def demo_antipattern(url: str, model: str) -> None:
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--url", default="http://127.0.0.1:8765", help="Conduit base URL")
-    p.add_argument("--model", default="claude-haiku-4-5-20251001",
-                   help="Model (Haiku is the cheapest)")
+    p.add_argument("--model", default=os.environ.get("CONDUIT_MODEL", "claude-haiku-4-5-20251001"),
+                   help="Model to use. Defaults to $CONDUIT_MODEL or Haiku (cheapest).")
     p.add_argument("--skip", action="append", default=[],
                    choices=["broken", "stateless", "stateful", "antipattern"],
                    help="Skip a scenario (repeatable)")

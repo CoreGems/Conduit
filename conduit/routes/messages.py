@@ -346,7 +346,10 @@ async def _handle_tool_use_request(req: MessageCreateRequest):
                     400,
                     detail={"type": "invalid_request_error", "message": "tool_result missing tool_use_id"},
                 )
-            if tool_use_id not in session.pending_futures:
+            # is_pending_tool_use_id covers both the "Future is live" case and
+            # the "handler hasn't fired yet" case (parallel tools). The id
+            # must have been observed by the stream layer for this session.
+            if not session.is_pending_tool_use_id(tool_use_id):
                 raise HTTPException(
                     400,
                     detail={"type": "invalid_request_error", "message": f"unknown tool_use_id: {tool_use_id}"},
