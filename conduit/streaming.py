@@ -22,6 +22,8 @@ import uuid
 from collections import deque
 from typing import Any, AsyncIterator
 
+from fastapi import HTTPException
+
 from claude_agent_sdk import (
     AssistantMessage,
     ResultMessage,
@@ -47,6 +49,124 @@ _HOSTED_RESULT_TYPE = {
 
 def _sse(event: str, data: dict) -> dict:
     return {"event": event, "data": json.dumps(data, separators=(",", ":"))}
+
+
+# Map an upstream HTTP status (surfaced by the SDK on a recoverable API error)
+# to the Anthropic error `type`. Anything else falls back to a generic api_error.
+_API_ERROR_TYPE = {
+    400: "invalid_request_error",
+    401: "authentication_error",
+    403: "permission_error",
+    404: "not_found_error",
+    413: "request_too_large",
+    429: "rate_limit_error",
+    529: "overloaded_error",
+}
+
+
+# Substrings that mark a subscription (Claude Max/Pro) usage-limit exhaustion —
+# distinct from a transient server rate limit. The Agent SDK surfaces the CLI's
+# usage-limit result as ordinary error text rather than a distinct status code,
+# so we detect it by content. Matched case-insensitively.
+_QUOTA_MARKERS = (
+    "usage limit reached",
+    "usage limit",
+    "reached your usage limit",
+    "credit balance is too low",
+    "out of credits",
+    "insufficient credits",
+    "quota exceeded",
+)
+
+
+# Shown when a turn ends with no assistant content and no explicit error signal.
+# The overwhelmingly common cause in practice is an exhausted Claude subscription
+# quota, so we name it rather than returning a bare "no content" placeholder.
+_EMPTY_TURN_DETAIL = (
+    "The model returned an empty response (no content and no error from the "
+    "upstream). The most common cause is an exhausted Claude subscription quota "
+    "(Max/Pro plan usage limit); it can also mean the turn was interrupted "
+    "before any output. Check your plan's usage limits — if quota is the cause, "
+    "retrying will not help until it resets."
+)
+
+
+def _looks_like_quota(text: str) -> bool:
+    low = text.lower()
+    return any(m in low for m in _QUOTA_MARKERS)
+
+
+def _quota_error(text: str) -> HTTPException:
+    """Build a clear, client-facing 429 for a subscription usage-limit hit."""
+    reset_hint = ""
+    # Claude Code emits "Claude AI usage limit reached|<unix_ts>"; surface the
+    # reset timestamp when present.
+    if "|" in text:
+        tail = text.rsplit("|", 1)[-1].strip()
+        if tail.isdigit():
+            reset_hint = f" Quota resets at unix time {tail}."
+    return HTTPException(
+        status_code=429,
+        detail={
+            "type": "rate_limit_error",
+            "message": (
+                "Claude subscription quota exhausted — your Max/Pro plan usage "
+                f"limit has been reached.{reset_hint} This is a plan-level limit, "
+                "not a transient rate limit, so retrying will not help until the "
+                f"quota resets. Upstream reported: {text.strip()}"
+            ),
+        },
+    )
+
+
+def _result_error(msg: ResultMessage) -> HTTPException | None:
+    """Inspect a ResultMessage for upstream/SDK failure signaling.
+
+    The SDK reports a recoverable upstream API error (429 / 5xx / 529 overloaded,
+    etc.) as a normal ResultMessage with ``is_error=True`` and/or
+    ``api_error_status`` set, carrying NO assistant content — not as a raised
+    exception. Subscription usage-limit ("out of quota") is surfaced the same
+    way, only with the reason carried as error text. If we don't catch these
+    here we'd return a 200 with empty content and zero tokens, which clients
+    read as "no content in LLM response". Translate them into a proper
+    Anthropic-format error so the caller can show something meaningful.
+
+    Returns an HTTPException to raise, or None if the result was a clean turn.
+    """
+    is_error = bool(getattr(msg, "is_error", False))
+    api_status = getattr(msg, "api_error_status", None)
+    subtype = getattr(msg, "subtype", None)
+
+    errors = getattr(msg, "errors", None) or []
+    result_text = getattr(msg, "result", None)
+    if errors:
+        text_blob = "; ".join(str(e) for e in errors)
+    elif result_text:
+        text_blob = str(result_text)
+    else:
+        text_blob = ""
+
+    # Only read `text_blob` as a failure reason when the SDK actually flagged
+    # this turn as an error. On a clean success turn `result` holds the model's
+    # real answer, which may legitimately contain phrases like "usage limit" —
+    # we must not misclassify that as a quota failure.
+    errorish = is_error or (isinstance(subtype, str) and subtype.startswith("error"))
+
+    if errorish and text_blob and _looks_like_quota(text_blob):
+        return _quota_error(text_blob)
+
+    if not is_error and api_status is None:
+        return None
+
+    status = api_status if isinstance(api_status, int) and 400 <= api_status < 600 else 502
+    etype = _API_ERROR_TYPE.get(status) or ("overloaded_error" if status == 503 else "api_error")
+
+    if text_blob:
+        detail_msg = text_blob
+    else:
+        detail_msg = f"upstream turn failed (subtype={subtype!r}, api_error_status={api_status})"
+
+    return HTTPException(status_code=status, detail={"type": etype, "message": detail_msg})
 
 
 def _rewrite_message_start(ev: dict, model: str) -> dict:
@@ -131,6 +251,18 @@ async def stream_anthropic_events(
                 yield _sse("message_stop", ev)
 
         elif isinstance(msg, ResultMessage):
+            err = _result_error(msg)
+            if not sent_message_start:
+                # Nothing has been written to the SSE stream yet, so we can still
+                # surface this as an HTTP error rather than a silent empty stream.
+                # An explicit error (incl. quota) wins; otherwise a turn that
+                # produced nothing at all is itself the failure to report.
+                if err is not None:
+                    raise err
+                raise HTTPException(
+                    status_code=502,
+                    detail={"type": "api_error", "message": _EMPTY_TURN_DETAIL},
+                )
             session.message_count += 1
             return
 
@@ -145,6 +277,7 @@ async def collect_non_streaming(
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
     content_blocks: list[dict] = []
     stop_reason: str | None = None
+    saw_message_start = False
     input_tokens = 0
     output_tokens = 0
     cache_creation_input_tokens = 0
@@ -175,14 +308,27 @@ async def collect_non_streaming(
                 cache_creation_input_tokens = int(usage.get("cache_creation_input_tokens", cache_creation_input_tokens))
                 cache_read_input_tokens = int(usage.get("cache_read_input_tokens", cache_read_input_tokens))
             elif ev.get("type") == "message_start":
+                saw_message_start = True
                 usage = (ev.get("message") or {}).get("usage") or {}
                 input_tokens = int(usage.get("input_tokens", input_tokens))
                 cache_creation_input_tokens = int(usage.get("cache_creation_input_tokens", cache_creation_input_tokens))
                 cache_read_input_tokens = int(usage.get("cache_read_input_tokens", cache_read_input_tokens))
         elif isinstance(msg, ResultMessage):
+            err = _result_error(msg)
+            if err is not None:
+                raise err
             session.message_count += 1
             stop_reason = stop_reason or getattr(msg, "stop_reason", None) or "end_turn"
             break
+
+    # An empty turn — no message_start, no content — means the upstream produced
+    # nothing (most often an exhausted subscription quota the SDK didn't flag as
+    # an error). Surface a 502 with a meaningful reason instead of a hollow 200.
+    if not saw_message_start and not content_blocks:
+        raise HTTPException(
+            status_code=502,
+            detail={"type": "api_error", "message": _EMPTY_TURN_DETAIL},
+        )
 
     return {
         "id": message_id,
@@ -276,6 +422,10 @@ async def stream_tool_events(
     block_map: dict[int, dict[str, Any]] = {}
     next_out_index = 0
     last_stop_reason: str | None = None
+    # True once we've emitted a `message_start` (nothing precedes it on the
+    # wire). If a turn ends without this ever flipping, the upstream produced
+    # nothing — treat that as a reportable failure, not a hollow success.
+    produced_output = False
     # Counts CUSTOM (client-defined) tool_use blocks since the last message_start.
     # Hosted tool_use blocks (WebSearch/WebFetch) are forwarded as server_tool_use
     # but don't increment this — they don't constitute a real client pause.
@@ -292,6 +442,11 @@ async def stream_tool_events(
         msg = await session.events_queue.get()
         if msg is _PUMP_END_SENTINEL:
             session.state = SessionState.IDLE
+            if not produced_output:
+                raise HTTPException(
+                    status_code=502,
+                    detail={"type": "api_error", "message": _EMPTY_TURN_DETAIL},
+                )
             return
         if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == "ERROR":
             session.state = SessionState.IDLE
@@ -316,6 +471,7 @@ async def stream_tool_events(
                     next_out_index = 0
                     visible_tool_use_count = 0
                     last_stop_reason = None
+                    produced_output = True
                     yield _sse("message_start", _rewrite_message_start(ev, model))
 
             elif etype == "content_block_start":
@@ -407,6 +563,18 @@ async def stream_tool_events(
                         return
 
         elif isinstance(msg, ResultMessage):
+            err = _result_error(msg)
+            if err is not None:
+                session.state = SessionState.IDLE
+                raise err
+            if not produced_output:
+                # Clean result but the turn yielded nothing — report it rather
+                # than letting the collector return empty `content: []`.
+                session.state = SessionState.IDLE
+                raise HTTPException(
+                    status_code=502,
+                    detail={"type": "api_error", "message": _EMPTY_TURN_DETAIL},
+                )
             session.message_count += 1
             session.state = SessionState.IDLE
             return

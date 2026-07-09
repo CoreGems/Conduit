@@ -56,7 +56,7 @@ The chat endpoint. Mirrors Anthropic's `/v1/messages` exactly, plus `session_id`
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `model` | string | ✅ | e.g. `"claude-sonnet-4-6"`, `"claude-haiku-4-5-20251001"`. **Bound at session creation** for stateful sessions — see §4.2. |
+| `model` | string | ✅ | e.g. `"claude-fable-5"` (newest, most capable), `"claude-opus-4-8"`, `"claude-sonnet-4-6"`, `"claude-haiku-4-5-20251001"`. Passed through verbatim to the Agent SDK — any model your Claude subscription can serve is accepted. **Bound at session creation** for stateful sessions — see §4.2. |
 | `messages` | `MessageParam[]` | ✅ | Standard Anthropic shape (see §3). |
 | `max_tokens` | int | ✅ | Standard Anthropic. |
 | `system` | string \| `TextBlockParam[]` | ❌ | System prompt. |
@@ -724,12 +724,52 @@ Conduit's error envelope follows Anthropic's:
 | 400 | Validation error — see `detail.message`. |
 | 404 | `session_id` not found. |
 | 422 | Pydantic validation failure on the request body (malformed JSON, missing required fields). `detail` is a list of pydantic errors. |
+| 429 | Rate limit **or** subscription quota exhausted — see §7.1. `detail.type` is `rate_limit_error`; `detail.message` states which. |
 | 500 | Internal server error (SDK crash, network failure to Claude). |
+| 502 | Upstream turn failed or produced no content — see §7.1. `detail.type` is `api_error`. |
+| 529 | Upstream overloaded (`detail.type` `overloaded_error`). Transient. |
 
 Retry guidance:
 - **404 on resume** → session expired, start the conversation over with a new initial request.
 - **422** → fix the request body; don't retry.
-- **500** → safe to retry once with backoff; if persistent, restart the server.
+- **429 (quota)** → **don't retry** — see §7.1. Retrying a plan usage-limit hit fails identically until the quota resets.
+- **429 (transient rate limit) / 529** → back off and retry.
+- **500 / 502** → safe to retry once with backoff; if persistent, restart the server.
+
+### 7.1 Empty responses and quota exhaustion
+
+The Agent SDK reports a failed upstream turn — a transient API error, an
+**exhausted Claude Max/Pro subscription quota**, or an interruption — as an
+ordinary end-of-turn signal carrying **no assistant content**, not as a raised
+exception. Earlier Conduit forwarded that as a `200` with `content: []`, which
+clients surfaced as noise like *"model returned an empty response"*. Conduit now
+detects these and returns a typed error with a meaningful `detail.message`
+instead of a hollow success, on **all** paths (plain chat, streaming, and
+custom/hosted tool turns):
+
+- **Subscription quota exhausted** (`"...usage limit reached..."`, credit
+  balance too low, etc.) → **429** `rate_limit_error`. The message names it as a
+  plan-level limit — *not* a transient rate limit — and includes the reset
+  timestamp when the upstream provides one. **Waiting for the reset (or
+  switching credentials/plan) is the only fix; retrying immediately will not
+  help.**
+- **Other upstream failure** (`is_error` / `api_error_status` set) → mapped to
+  the matching Anthropic status (`429`/`404`/`529`/… ) or `502 api_error`, with
+  the upstream reason in `detail.message`.
+- **Empty turn, no error signal** → **502** `api_error` with a message noting
+  the likely cause (usually quota; sometimes an interrupted turn).
+
+So a client no longer needs to special-case an empty `content` array to explain
+what went wrong — read `detail.message`. Example quota response:
+
+```json
+{
+  "detail": {
+    "type": "rate_limit_error",
+    "message": "Claude subscription quota exhausted — your Max/Pro plan usage limit has been reached. Quota resets at unix time 1751850000. This is a plan-level limit, not a transient rate limit, so retrying will not help until the quota resets. Upstream reported: Claude AI usage limit reached|1751850000"
+  }
+}
+```
 
 ---
 
@@ -1178,6 +1218,11 @@ curl -i -sS -X POST http://127.0.0.1:8765/v1/messages \
 ### 10.12 `400 tool_result requires session_id` on resume
 - Your resume request has a `tool_result` block in the last user message, but the request body has no `session_id`. Capture `x-conduit-session-id` from the initial response's headers and pass it on every resume.
 - If you're in a multi-cycle scenario (§5.6), use the same `session_id` for every cycle — don't try to capture a new id from each response.
+
+### 10.13 Client reports an "empty response" / empty `content`
+- As of the §7.1 change Conduit no longer returns a hollow `200` with `content: []` for a failed or contentless turn — it returns a typed error (`429`/`502`/…) with a human-readable `detail.message`. If your client still prints something like *"returned an empty response"*, it's swallowing the non-2xx body: read `detail.message` on error responses instead of only inspecting `content`.
+- The most common trigger is an **exhausted Claude Max/Pro subscription quota** — you'll get `429 rate_limit_error` whose message says "usage limit reached". Wait for the reset (timestamp is in the message when available); retrying immediately fails identically. See §7.1.
+- If you get `502 api_error` ("empty response … no error from the upstream"), the turn produced nothing and the SDK didn't flag why — usually still quota, occasionally an interrupted turn. One backed-off retry is reasonable.
 
 ---
 
