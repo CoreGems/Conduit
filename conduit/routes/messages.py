@@ -24,6 +24,7 @@ from conduit.schema import MessageCreateRequest
 from conduit.sessions import manager
 from conduit.streaming import (
     collect_non_streaming,
+    guard_sse,
     stream_anthropic_events,
     stream_tool_events,
 )
@@ -279,7 +280,9 @@ async def create_message(req: MessageCreateRequest):
     if req.stream:
         async def event_source():
             async with session.lock:
-                async for ev in stream_anthropic_events(session, user_text, effective_model):
+                # guard_sse: the response head is already sent once we're
+                # iterating, so failures must go out as an `error` event.
+                async for ev in guard_sse(stream_anthropic_events(session, user_text, effective_model)):
                     yield ev
 
         return EventSourceResponse(event_source(), headers=headers)
@@ -388,7 +391,9 @@ async def _handle_tool_use_request(req: MessageCreateRequest):
     if req.stream:
         async def event_source():
             try:
-                async for ev in stream_tool_events(session, user_text, effective_model):
+                # guard_sse: the response head is already sent once we're
+                # iterating, so failures must go out as an `error` event.
+                async for ev in guard_sse(stream_tool_events(session, user_text, effective_model)):
                     yield ev
             finally:
                 await _drain_trailing_pump()

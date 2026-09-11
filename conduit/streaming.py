@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import uuid
 from collections import deque
 from typing import Any, AsyncIterator
@@ -35,6 +36,8 @@ from claude_agent_sdk import (
 from conduit.sessions import Session, SessionState
 from conduit.tool_bridge import is_hosted_sdk_tool, local_name_from_full
 
+log = logging.getLogger(__name__)
+
 
 # Map SDK hosted tool name to the wire-format result block type.
 _HOSTED_RESULT_TYPE = {
@@ -49,6 +52,57 @@ _HOSTED_RESULT_TYPE = {
 
 def _sse(event: str, data: dict) -> dict:
     return {"event": event, "data": json.dumps(data, separators=(",", ":"))}
+
+
+def _error_event(exc: HTTPException) -> dict:
+    """Anthropic wire-format ``error`` SSE event carrying an HTTPException.
+
+    Same shape the real API emits when a request fails after the stream has
+    opened. The Anthropic SDKs raise it client-side as an ``APIStatusError``
+    whose body carries our ``type`` / ``message``.
+    """
+    detail = exc.detail
+    if not isinstance(detail, dict):
+        detail = {"type": "api_error", "message": str(detail)}
+    return _sse(
+        "error",
+        {
+            "type": "error",
+            "error": {
+                "type": detail.get("type") or "api_error",
+                "message": detail.get("message") or f"HTTP {exc.status_code}",
+            },
+        },
+    )
+
+
+async def guard_sse(events: AsyncIterator[dict]) -> AsyncIterator[dict]:
+    """Deliver a stream failure to the client as an ``error`` event.
+
+    sse_starlette writes the response head (``200`` + SSE headers) before it
+    pulls the first item from the body iterator, so by the time any stream
+    function raises, the HTTP status is already on the wire. Left alone,
+    Starlette re-raises the exception as "Caught handled exception, but
+    response already started", the connection is cut, and the client sees a
+    truncated ``200`` stream with no error at all. Instead, emit the failure
+    as an Anthropic ``error`` event and end the stream cleanly.
+
+    Only the streaming routes go through this. The non-streaming collectors
+    let the HTTPException propagate so FastAPI returns a real 4xx/5xx body.
+    """
+    try:
+        async for ev in events:
+            yield ev
+    except HTTPException as exc:
+        yield _error_event(exc)
+    except Exception as exc:  # noqa: BLE001 — anything else would also cut the stream
+        log.exception("streaming turn failed")
+        yield _error_event(
+            HTTPException(
+                status_code=500,
+                detail={"type": "api_error", "message": f"{type(exc).__name__}: {exc}"},
+            )
+        )
 
 
 # Map an upstream HTTP status (surfaced by the SDK on a recoverable API error)
@@ -252,13 +306,15 @@ async def stream_anthropic_events(
 
         elif isinstance(msg, ResultMessage):
             err = _result_error(msg)
+            if err is not None:
+                # Flagged failure (incl. quota). Raise even if content was
+                # already streamed — the route wraps us in guard_sse, which
+                # turns this into an `error` event, exactly how the real API
+                # reports a mid-stream failure.
+                raise err
             if not sent_message_start:
-                # Nothing has been written to the SSE stream yet, so we can still
-                # surface this as an HTTP error rather than a silent empty stream.
-                # An explicit error (incl. quota) wins; otherwise a turn that
-                # produced nothing at all is itself the failure to report.
-                if err is not None:
-                    raise err
+                # Clean result but the turn produced nothing at all — that is
+                # itself the failure to report, not a hollow success.
                 raise HTTPException(
                     status_code=502,
                     detail={"type": "api_error", "message": _EMPTY_TURN_DETAIL},

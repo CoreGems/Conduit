@@ -9,6 +9,7 @@ content in LLM response". These tests pin the new behaviour: a proper
 HTTPException with a meaningful message is raised instead.
 """
 import asyncio
+import json
 
 import pytest
 from fastapi import HTTPException
@@ -19,6 +20,8 @@ from conduit.streaming import (
     _looks_like_quota,
     _result_error,
     collect_non_streaming,
+    guard_sse,
+    stream_anthropic_events,
     stream_tool_events,
 )
 
@@ -196,3 +199,126 @@ async def test_stream_tool_events_raises_quota():
         await _drain_tool_events(sess)
     assert ei.value.status_code == 429
     assert "quota" in ei.value.detail["message"].lower()
+
+
+# --- plain streaming path ------------------------------------------------------
+
+def _message_start() -> StreamEvent:
+    return StreamEvent(
+        uuid="u", session_id="s",
+        event={"type": "message_start",
+               "message": {"id": "msg_1", "usage": {"input_tokens": 5}}},
+    )
+
+
+async def _collect(agen) -> list[dict]:
+    return [ev async for ev in agen]
+
+
+async def test_stream_anthropic_events_raises_on_empty_turn():
+    sess = _FakeSession([_result()])
+    with pytest.raises(HTTPException) as ei:
+        await _collect(stream_anthropic_events(sess, "hi", "claude-opus-4-8"))
+    assert ei.value.status_code == 502
+
+
+async def test_stream_anthropic_events_raises_error_even_after_content():
+    # A flagged failure must surface even once message_start went out — the
+    # route's guard_sse turns it into a mid-stream `error` event, like the
+    # real API does. Previously it was swallowed into a truncated stream.
+    sess = _FakeSession([
+        _message_start(),
+        _result(is_error=True, api_error_status=529),
+    ])
+    with pytest.raises(HTTPException) as ei:
+        await _collect(stream_anthropic_events(sess, "hi", "claude-opus-4-8"))
+    assert ei.value.status_code == 529
+
+
+# --- guard_sse: failures after the response head is sent -----------------------
+#
+# sse_starlette sends the 200 + SSE headers before pulling the first event, so
+# an HTTPException raised inside the generator can never become an HTTP error
+# status. The observed failure was Starlette's "Caught handled exception, but
+# response already started" and a dropped connection with no error visible to
+# the client. guard_sse must translate it into an Anthropic `error` event.
+
+def _parse_error(ev: dict) -> dict:
+    assert ev["event"] == "error"
+    data = json.loads(ev["data"])
+    assert data["type"] == "error"
+    return data["error"]
+
+
+async def test_guard_sse_turns_quota_into_error_event():
+    sess = _FakeToolSession([_result(
+        is_error=True, result="Claude AI usage limit reached|1751850000")])
+    events = await _collect(guard_sse(stream_tool_events(sess, "hi", "claude-opus-4-8")))
+    assert len(events) == 1
+    err = _parse_error(events[0])
+    assert err["type"] == "rate_limit_error"
+    assert "quota" in err["message"].lower()
+    assert "1751850000" in err["message"]
+
+
+async def test_guard_sse_keeps_prior_events_and_appends_error():
+    sess = _FakeSession([
+        _message_start(),
+        _result(is_error=True, api_error_status=400,
+                result="API Error: 400 Claude Code 2.1.147 does not support this model"),
+    ])
+    events = await _collect(guard_sse(stream_anthropic_events(sess, "hi", "claude-fable-5-1")))
+    assert [e["event"] for e in events] == ["message_start", "error"]
+    err = _parse_error(events[-1])
+    assert err["type"] == "invalid_request_error"
+    assert "does not support this model" in err["message"]
+
+
+async def test_guard_sse_passes_clean_stream_through():
+    async def ok():
+        yield {"event": "message_start", "data": "{}"}
+        yield {"event": "message_stop", "data": "{}"}
+
+    events = await _collect(guard_sse(ok()))
+    assert [e["event"] for e in events] == ["message_start", "message_stop"]
+
+
+async def test_guard_sse_reports_unexpected_exception_as_api_error():
+    async def boom():
+        yield {"event": "message_start", "data": "{}"}
+        raise RuntimeError("pump died")
+
+    events = await _collect(guard_sse(boom()))
+    err = _parse_error(events[-1])
+    assert err["type"] == "api_error"
+    assert "RuntimeError" in err["message"] and "pump died" in err["message"]
+
+
+async def test_guard_sse_through_asgi_stack_does_not_drop_connection():
+    # End-to-end through FastAPI + sse_starlette: the body must end with the
+    # error event and the request must complete without an exception.
+    import httpx
+    from fastapi import FastAPI
+    from sse_starlette.sse import EventSourceResponse
+
+    async def failing():
+        yield {"event": "message_start", "data": "{}"}
+        raise HTTPException(
+            status_code=529,
+            detail={"type": "overloaded_error", "message": "Overloaded"},
+        )
+
+    app = FastAPI()
+
+    @app.get("/stream")
+    async def stream():
+        return EventSourceResponse(guard_sse(failing()))
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/stream")
+
+    assert resp.status_code == 200
+    assert "event: message_start" in resp.text
+    assert "event: error" in resp.text
+    assert '"overloaded_error"' in resp.text

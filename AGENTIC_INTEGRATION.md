@@ -720,7 +720,7 @@ Conduit's error envelope follows Anthropic's:
 
 | Code | Meaning |
 |---|---|
-| 200 | Success (including SSE streams that complete normally). |
+| 200 | Success (including SSE streams that complete normally). A **streaming** request that fails after the stream has opened is also `200` — the failure arrives as an SSE `error` event, see §7.1. |
 | 400 | Validation error — see `detail.message`. |
 | 404 | `session_id` not found. |
 | 422 | Pydantic validation failure on the request body (malformed JSON, missing required fields). `detail` is a list of pydantic errors. |
@@ -770,6 +770,24 @@ what went wrong — read `detail.message`. Example quota response:
   }
 }
 ```
+
+**Streaming requests (`stream: true`).** The SSE response head (`200` + SSE
+headers) is written before the first event is produced, so by the time the
+failure is known the HTTP status can no longer change. Conduit therefore does
+what the real Anthropic API does for a mid-stream failure: it emits an `error`
+event with the same `type` / `message` and ends the stream. This can arrive
+before any `message_start` (the turn produced nothing) or after some content
+(the turn failed part-way):
+
+```
+event: error
+data: {"type":"error","error":{"type":"rate_limit_error","message":"Claude subscription quota exhausted — ..."}}
+```
+
+The Anthropic SDKs raise this client-side as an `APIStatusError` whose `.body`
+carries the `error` object, so `str(exc)` / `exc.body["error"]["message"]` show
+the reason. Hand-rolled SSE readers must handle `event: error` — a stream that
+ends on it did **not** complete normally, regardless of the `200`.
 
 ---
 
@@ -1222,6 +1240,7 @@ curl -i -sS -X POST http://127.0.0.1:8765/v1/messages \
 ### 10.13 Client reports an "empty response" / empty `content`
 - As of the §7.1 change Conduit no longer returns a hollow `200` with `content: []` for a failed or contentless turn — it returns a typed error (`429`/`502`/…) with a human-readable `detail.message`. If your client still prints something like *"returned an empty response"*, it's swallowing the non-2xx body: read `detail.message` on error responses instead of only inspecting `content`.
 - The most common trigger is an **exhausted Claude Max/Pro subscription quota** — you'll get `429 rate_limit_error` whose message says "usage limit reached". Wait for the reset (timestamp is in the message when available); retrying immediately fails identically. See §7.1.
+- **Streaming clients** get the same information as an SSE `error` event on a `200` response (the status is already sent when the failure is detected) — the Anthropic SDKs raise it as `APIStatusError`. If your stream ends abruptly with no `message_stop` *and* no `error` event, you are running a Conduit build older than this fix: the server log shows `RuntimeError: Caught handled exception, but response already started`. Upgrade.
 - If you get `502 api_error` ("empty response … no error from the upstream"), the turn produced nothing and the SDK didn't flag why — usually still quota, occasionally an interrupted turn. One backed-off retry is reasonable.
 
 ---
