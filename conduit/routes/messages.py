@@ -50,7 +50,28 @@ def _materialize_content(content) -> list | str | None:
         return None
 
 
-def _last_user_text(req: MessageCreateRequest) -> str:
+# Block types that carry user prompt data and pass through to the SDK.
+_PROMPT_BLOCK_TYPES = ("text", "image")
+
+
+def _prompt_blocks(content: list) -> list[dict]:
+    return [
+        b for b in content
+        if isinstance(b, dict) and b.get("type") in _PROMPT_BLOCK_TYPES
+    ]
+
+
+def _has_image(blocks: list[dict]) -> bool:
+    return any(b.get("type") == "image" for b in blocks)
+
+
+def _last_user_content(req: MessageCreateRequest) -> str | list[dict]:
+    """Prompt for the stateful (session_id) path: the newest user turn.
+
+    Text-only turns flatten to a plain string (the SDK's string fast path).
+    A turn carrying image blocks returns its text+image block list, passed
+    through to the SDK verbatim.
+    """
     for m in reversed(list(req.messages)):
         if m.get("role") != "user":
             continue
@@ -58,13 +79,13 @@ def _last_user_text(req: MessageCreateRequest) -> str:
         if isinstance(content, str):
             return content
         if isinstance(content, list):
-            parts = [
-                b["text"] for b in content
-                if isinstance(b, dict) and b.get("type") == "text" and "text" in b
-            ]
+            blocks = _prompt_blocks(content)
+            if _has_image(blocks):
+                return blocks
+            parts = [b["text"] for b in blocks if b.get("type") == "text" and "text" in b]
             if parts:
                 return "\n".join(parts)
-    raise HTTPException(400, detail={"type": "invalid_request_error", "message": "no user text content in messages"})
+    raise HTTPException(400, detail={"type": "invalid_request_error", "message": "no user text or image content in messages"})
 
 
 def _system_prompt_text(req: MessageCreateRequest) -> str | None:
@@ -93,23 +114,21 @@ def _text_of_content(content) -> str:
     return ""
 
 
-def _build_replay_prompt(req: MessageCreateRequest) -> str:
+def _build_replay_prompt(req: MessageCreateRequest) -> str | list[dict]:
     """For stateless multi-turn (Pattern A): the SDK session is fresh and has
     no context, so concatenate the conversation history into the user prompt
     we send. Single-turn requests fall back to just the user text.
+
+    A final user turn carrying image blocks is returned as a content-block
+    list, with the flattened history (if any) prepended as a text block.
+    Images in *earlier* turns are dropped along with every other non-text
+    block — only the newest turn's images reach the model.
     """
     msgs = list(req.messages)
     if not msgs:
         raise HTTPException(400, detail={"type": "invalid_request_error", "message": "messages array is empty"})
 
-    # Single-turn (one user message) — no replay needed.
-    if len(msgs) == 1 and msgs[0].get("role") == "user":
-        text = _text_of_content(msgs[0].get("content"))
-        if not text:
-            raise HTTPException(400, detail={"type": "invalid_request_error", "message": "no user text content in messages"})
-        return text
-
-    # Multi-turn — replay everything as one prompt.
+    # History = everything before the final message, flattened to text.
     history_lines: list[str] = []
     for m in msgs[:-1]:
         role = m.get("role", "")
@@ -120,18 +139,26 @@ def _build_replay_prompt(req: MessageCreateRequest) -> str:
             history_lines.append(f"User: {text}")
         elif role == "assistant":
             history_lines.append(f"Assistant: {text}")
+    history = "\n\n".join(history_lines)
 
     last = msgs[-1]
     if last.get("role") != "user":
         raise HTTPException(400, detail={"type": "invalid_request_error", "message": "last message must be from the user"})
-    last_text = _text_of_content(last.get("content"))
+    last_content = _materialize_content(last.get("content"))
+
+    if isinstance(last_content, list):
+        blocks = _prompt_blocks(last_content)
+        if _has_image(blocks):
+            if history:
+                return [{"type": "text", "text": f"{history}\n\nUser:"}] + blocks
+            return blocks
+
+    last_text = _text_of_content(last_content)
     if not last_text:
-        raise HTTPException(400, detail={"type": "invalid_request_error", "message": "no user text content in final message"})
+        raise HTTPException(400, detail={"type": "invalid_request_error", "message": "no user text or image content in final message"})
 
-    if not history_lines:
+    if not history:
         return last_text
-
-    history = "\n\n".join(history_lines)
     return f"{history}\n\nUser: {last_text}"
 
 
@@ -159,7 +186,7 @@ def _trailing_tool_results(req: MessageCreateRequest) -> list[dict] | None:
 # tool-use non-streaming: collect the SSE stream into a single Message dict
 # ---------------------------------------------------------------------------
 
-async def _collect_tool_message(session, user_text, model) -> dict:
+async def _collect_tool_message(session, user_content, model) -> dict:
     msg: dict = {
         "id": f"msg_{uuid.uuid4().hex[:24]}",
         "type": "message",
@@ -177,7 +204,7 @@ async def _collect_tool_message(session, user_text, model) -> dict:
     }
     blocks: dict[int, dict] = {}
 
-    async for sse in stream_tool_events(session, user_text, model):
+    async for sse in stream_tool_events(session, user_content, model):
         data = json.loads(sse["data"])
         t = data.get("type")
         if t == "message_start":
@@ -259,7 +286,7 @@ async def create_message(req: MessageCreateRequest):
                 404,
                 detail={"type": "invalid_request_error", "message": f"session {req.session_id} not found"},
             )
-        user_text = _last_user_text(req)
+        user_content = _last_user_content(req)
     else:
         # Stateless / auto-allocated: create a fresh session and replay the
         # client's full message history into the prompt so the model has
@@ -272,7 +299,7 @@ async def create_message(req: MessageCreateRequest):
             effort=req.effort,
             include_thinking=req.include_thinking,
         )
-        user_text = _build_replay_prompt(req)
+        user_content = _build_replay_prompt(req)
 
     effective_model = session.model or req.model
     headers = {"x-conduit-session-id": session.id}
@@ -282,13 +309,13 @@ async def create_message(req: MessageCreateRequest):
             async with session.lock:
                 # guard_sse: the response head is already sent once we're
                 # iterating, so failures must go out as an `error` event.
-                async for ev in guard_sse(stream_anthropic_events(session, user_text, effective_model)):
+                async for ev in guard_sse(stream_anthropic_events(session, user_content, effective_model)):
                     yield ev
 
         return EventSourceResponse(event_source(), headers=headers)
 
     async with session.lock:
-        body = await collect_non_streaming(session, user_text, effective_model)
+        body = await collect_non_streaming(session, user_content, effective_model)
     return JSONResponse(content=body, headers=headers)
 
 
@@ -359,15 +386,15 @@ async def _handle_tool_use_request(req: MessageCreateRequest):
                 )
         for block in tool_results:  # type: ignore[union-attr]
             session.deliver_tool_result(block["tool_use_id"], block.get("content"))
-        user_text: str | None = None  # don't call query() on resume
+        user_content: str | list[dict] | None = None  # don't call query() on resume
     else:
-        # Choose user_text the same way plain chat does:
+        # Choose user_content the same way plain chat does:
         #   - With session_id (Pattern B): session has state, only need new turn.
         #   - Without session_id (Pattern A): replay client's full history into prompt.
         if req.session_id:
-            user_text = _last_user_text(req)
+            user_content = _last_user_content(req)
         else:
-            user_text = _build_replay_prompt(req)
+            user_content = _build_replay_prompt(req)
 
     headers = {"x-conduit-session-id": session.id}
 
@@ -393,7 +420,7 @@ async def _handle_tool_use_request(req: MessageCreateRequest):
             try:
                 # guard_sse: the response head is already sent once we're
                 # iterating, so failures must go out as an `error` event.
-                async for ev in guard_sse(stream_tool_events(session, user_text, effective_model)):
+                async for ev in guard_sse(stream_tool_events(session, user_content, effective_model)):
                     yield ev
             finally:
                 await _drain_trailing_pump()
@@ -401,7 +428,7 @@ async def _handle_tool_use_request(req: MessageCreateRequest):
         return EventSourceResponse(event_source(), headers=headers)
 
     try:
-        body = await _collect_tool_message(session, user_text, effective_model)
+        body = await _collect_tool_message(session, user_content, effective_model)
     finally:
         await _drain_trailing_pump()
     return JSONResponse(content=body, headers=headers)

@@ -156,7 +156,7 @@ See §1.2.
 | `"text"` | `"text": str` | Either role |
 | `"tool_use"` | `"id": str`, `"name": str`, `"input": obj` | Assistant only (server emits these) |
 | `"tool_result"` | `"tool_use_id": str`, `"content": str OR ContentBlock[]` | **User only** (you send these on resume) |
-| `"image"` | `"source": {...}` | User (not Phase 2 tested) |
+| `"image"` | `"source": {"type": "base64", "media_type": str, "data": str}` | User. Supported on the **newest** user turn (alongside text); images in earlier history turns are dropped during stateless replay |
 
 ### 3.2 Tool declarations (entries in `tools`)
 

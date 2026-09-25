@@ -54,6 +54,26 @@ def _sse(event: str, data: dict) -> dict:
     return {"event": event, "data": json.dumps(data, separators=(",", ":"))}
 
 
+def _as_sdk_prompt(user_content: str | list[dict]) -> str | AsyncIterator[dict]:
+    """Adapt a route-level prompt to what ``ClaudeSDKClient.query()`` accepts.
+
+    ``query()`` takes either a plain string or an async iterable of full
+    message dicts. Content-block prompts (turns carrying image blocks) need
+    the latter: wrap the blocks in a single Anthropic-shaped user message.
+    """
+    if isinstance(user_content, str):
+        return user_content
+
+    async def _one() -> AsyncIterator[dict]:
+        yield {
+            "type": "user",
+            "message": {"role": "user", "content": user_content},
+            "parent_tool_use_id": None,
+        }
+
+    return _one()
+
+
 def _error_event(exc: HTTPException) -> dict:
     """Anthropic wire-format ``error`` SSE event carrying an HTTPException.
 
@@ -251,10 +271,10 @@ def _clean_tool_use_block(content_block: dict) -> dict:
 
 async def stream_anthropic_events(
     session: Session,
-    user_text: str,
+    user_content: str | list[dict],
     model: str,
 ) -> AsyncIterator[dict]:
-    await session.client.query(user_text)
+    await session.client.query(_as_sdk_prompt(user_content))
 
     block_map: dict[int, dict[str, Any]] = {}
     next_out_index = 0
@@ -325,10 +345,10 @@ async def stream_anthropic_events(
 
 async def collect_non_streaming(
     session: Session,
-    user_text: str,
+    user_content: str | list[dict],
     model: str,
 ) -> dict:
-    await session.client.query(user_text)
+    await session.client.query(_as_sdk_prompt(user_content))
 
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
     content_blocks: list[dict] = []
@@ -431,15 +451,16 @@ async def _pump_session(session: Session) -> None:
 
 async def stream_tool_events(
     session: Session,
-    user_text: str | None,
+    user_content: str | list[dict] | None,
     model: str,
 ) -> AsyncIterator[dict]:
     """Stream a turn (initial or resume) for a tool-use session.
 
     Args:
-      user_text:
-        - For an **initial** request, the new user prompt; we call query()
-          to kick off the SDK turn before draining the queue.
+      user_content:
+        - For an **initial** request, the new user prompt (plain text, or a
+          text+image content-block list); we call query() to kick off the
+          SDK turn before draining the queue.
         - For a **resume** request, pass None. The routes layer has already
           delivered the tool_result(s) to the parked Future(s); the pump is
           continuing to produce events.
@@ -452,7 +473,7 @@ async def stream_tool_events(
     if session.events_queue is None:
         raise RuntimeError("stream_tool_events called on non-tool session")
 
-    if user_text is not None:
+    if user_content is not None:
         # New turn. Each SDK receive_response() is per-query() — it yields
         # events for one query and exhausts after ResultMessage. If the prior
         # pump is still alive (custom-tool pause: parked in @tool handler,
@@ -463,10 +484,10 @@ async def stream_tool_events(
         # us with the prior turn fully done, pump_task.done() == True.
         if session.pump_task is None or session.pump_task.done():
             session.events_queue = asyncio.Queue()
-            await session.client.query(user_text)
+            await session.client.query(_as_sdk_prompt(user_content))
             session.pump_task = asyncio.create_task(_pump_session(session))
         else:
-            await session.client.query(user_text)
+            await session.client.query(_as_sdk_prompt(user_content))
     else:
         # Resume (tool_result delivered above). The pump must still be alive,
         # parked inside the @tool handler awaiting our Future.
