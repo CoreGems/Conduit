@@ -37,6 +37,31 @@ class SessionState(str, Enum):
     CLOSED = "closed"
 
 
+def _to_mcp_block(block: Any) -> Any:
+    """Translate one Anthropic tool_result content block to MCP shape.
+
+    The client sends Anthropic-format blocks, but the SDK's in-process MCP
+    bridge expects MCP content: images as ``{"type": "image", "data",
+    "mimeType"}`` rather than ``{"type": "image", "source": {...}}``. Passing
+    the Anthropic shape through raises KeyError inside the SDK, so a
+    screenshot returned from a client tool never reaches the model.
+
+    Base64 images are converted. URL images have no MCP equivalent (MCP
+    images must carry their bytes), so they degrade to a text note. Anything
+    else, including blocks already in MCP shape, passes through unchanged.
+    """
+    if not isinstance(block, dict) or block.get("type") != "image":
+        return block
+    source = block.get("source")
+    if not isinstance(source, dict):
+        return block  # already MCP-shaped (data/mimeType) or unknown; leave it
+    if source.get("type") == "base64":
+        return {"type": "image", "data": source.get("data", ""), "mimeType": source.get("media_type", "image/png")}
+    if source.get("type") == "url":
+        return {"type": "text", "text": f"[conduit] image by URL is not supported in tool_result; send base64 instead: {source.get('url', '')}"}
+    return block
+
+
 @dataclass
 class Session:
     id: str
@@ -131,7 +156,7 @@ class Session:
         if isinstance(content, str):
             payload = {"content": [{"type": "text", "text": content}]}
         elif isinstance(content, list):
-            payload = {"content": content}
+            payload = {"content": [_to_mcp_block(b) for b in content]}
         else:
             payload = {"content": [{"type": "text", "text": str(content)}]}
 
