@@ -49,3 +49,40 @@ def test_stream_default_false():
         "messages": [{"role": "user", "content": "hi"}],
     })
     assert req.stream is False
+
+
+def test_nested_block_lists_are_materialised_to_real_lists():
+    """pydantic hands back lazy ValidatorIterators for nested lists (a
+    document's `source.content`, a tool_result's block list). They must come
+    out as real lists: route code does isinstance(list) checks and the blocks
+    are json-serialised verbatim to the SDK."""
+    import json
+
+    req = MessageCreateRequest.model_validate({
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 1024,
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "document",
+                 "source": {"type": "content", "content": [
+                     {"type": "text", "text": "w1"}, {"type": "text", "text": "w2"}]},
+                 "title": "windows"},
+                {"type": "text", "text": "q"},
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {"a": 1}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": [
+                    {"type": "text", "text": "72F"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}},
+                ]},
+            ]},
+        ],
+    })
+    doc = req.messages[0]["content"][0]
+    assert isinstance(doc["source"]["content"], list)
+    assert [b["text"] for b in doc["source"]["content"]] == ["w1", "w2"]
+    tr = req.messages[2]["content"][0]
+    assert isinstance(tr["content"], list)
+    assert [b["type"] for b in tr["content"]] == ["text", "image"]
+    json.dumps(req.messages)  # whole tree is plain data

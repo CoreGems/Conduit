@@ -13,9 +13,6 @@ Routes traffic between three modes:
 """
 from __future__ import annotations
 
-import json
-import uuid
-
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse  # noqa: F401  (used in route)
@@ -23,6 +20,7 @@ from sse_starlette.sse import EventSourceResponse  # noqa: F401  (used in route)
 from conduit.schema import MessageCreateRequest
 from conduit.sessions import manager
 from conduit.streaming import (
+    collect_message_from_sse,
     collect_non_streaming,
     guard_sse,
     stream_anthropic_events,
@@ -51,7 +49,10 @@ def _materialize_content(content) -> list | str | None:
 
 
 # Block types that carry user prompt data and pass through to the SDK.
-_PROMPT_BLOCK_TYPES = ("text", "image")
+# `document` blocks (text / PDF / custom-content sources, with or without
+# `citations: {enabled: true}`) are forwarded verbatim: the Agent SDK hands
+# them to the API unchanged and cited answers come back as `citations_delta`.
+_PROMPT_BLOCK_TYPES = ("text", "image", "document")
 
 
 def _prompt_blocks(content: list) -> list[dict]:
@@ -61,15 +62,17 @@ def _prompt_blocks(content: list) -> list[dict]:
     ]
 
 
-def _has_image(blocks: list[dict]) -> bool:
-    return any(b.get("type") == "image" for b in blocks)
+def _has_rich_blocks(blocks: list[dict]) -> bool:
+    """True if the turn carries anything that can't be flattened to a string
+    (image or document blocks) and must reach the SDK in content-block form."""
+    return any(b.get("type") != "text" for b in blocks)
 
 
 def _last_user_content(req: MessageCreateRequest) -> str | list[dict]:
     """Prompt for the stateful (session_id) path: the newest user turn.
 
     Text-only turns flatten to a plain string (the SDK's string fast path).
-    A turn carrying image blocks returns its text+image block list, passed
+    A turn carrying image or document blocks returns its block list, passed
     through to the SDK verbatim.
     """
     for m in reversed(list(req.messages)):
@@ -80,12 +83,12 @@ def _last_user_content(req: MessageCreateRequest) -> str | list[dict]:
             return content
         if isinstance(content, list):
             blocks = _prompt_blocks(content)
-            if _has_image(blocks):
+            if _has_rich_blocks(blocks):
                 return blocks
             parts = [b["text"] for b in blocks if b.get("type") == "text" and "text" in b]
             if parts:
                 return "\n".join(parts)
-    raise HTTPException(400, detail={"type": "invalid_request_error", "message": "no user text or image content in messages"})
+    raise HTTPException(400, detail={"type": "invalid_request_error", "message": "no user text, image or document content in messages"})
 
 
 def _system_prompt_text(req: MessageCreateRequest) -> str | None:
@@ -119,10 +122,10 @@ def _build_replay_prompt(req: MessageCreateRequest) -> str | list[dict]:
     no context, so concatenate the conversation history into the user prompt
     we send. Single-turn requests fall back to just the user text.
 
-    A final user turn carrying image blocks is returned as a content-block
-    list, with the flattened history (if any) prepended as a text block.
-    Images in *earlier* turns are dropped along with every other non-text
-    block — only the newest turn's images reach the model.
+    A final user turn carrying image or document blocks is returned as a
+    content-block list, with the flattened history (if any) prepended as a
+    text block. Images and documents in *earlier* turns are dropped along
+    with every other non-text block — only the newest turn's reach the model.
     """
     msgs = list(req.messages)
     if not msgs:
@@ -148,14 +151,14 @@ def _build_replay_prompt(req: MessageCreateRequest) -> str | list[dict]:
 
     if isinstance(last_content, list):
         blocks = _prompt_blocks(last_content)
-        if _has_image(blocks):
+        if _has_rich_blocks(blocks):
             if history:
                 return [{"type": "text", "text": f"{history}\n\nUser:"}] + blocks
             return blocks
 
     last_text = _text_of_content(last_content)
     if not last_text:
-        raise HTTPException(400, detail={"type": "invalid_request_error", "message": "no user text or image content in final message"})
+        raise HTTPException(400, detail={"type": "invalid_request_error", "message": "no user text, image or document content in final message"})
 
     if not history:
         return last_text
@@ -187,83 +190,9 @@ def _trailing_tool_results(req: MessageCreateRequest) -> list[dict] | None:
 # ---------------------------------------------------------------------------
 
 async def _collect_tool_message(session, user_content, model) -> dict:
-    msg: dict = {
-        "id": f"msg_{uuid.uuid4().hex[:24]}",
-        "type": "message",
-        "role": "assistant",
-        "model": model,
-        "content": [],
-        "stop_reason": "end_turn",
-        "stop_sequence": None,
-        "usage": {
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": 0,
-        },
-    }
-    blocks: dict[int, dict] = {}
-
-    async for sse in stream_tool_events(session, user_content, model):
-        data = json.loads(sse["data"])
-        t = data.get("type")
-        if t == "message_start":
-            m = data["message"]
-            msg["id"] = m.get("id", msg["id"])
-            msg["model"] = m.get("model", model)
-            u = m.get("usage") or {}
-            msg["usage"]["input_tokens"] = u.get("input_tokens", 0)
-            msg["usage"]["cache_creation_input_tokens"] = u.get("cache_creation_input_tokens", 0)
-            msg["usage"]["cache_read_input_tokens"] = u.get("cache_read_input_tokens", 0)
-        elif t == "content_block_start":
-            idx = data["index"]
-            blocks[idx] = dict(data["content_block"])
-            # Both custom tool_use and hosted server_tool_use stream their input
-            # as input_json_delta chunks that we reassemble.
-            if blocks[idx].get("type") in ("tool_use", "server_tool_use"):
-                blocks[idx].setdefault("input", {})
-                blocks[idx]["_input_partial"] = ""
-        elif t == "content_block_delta":
-            idx = data["index"]
-            delta = data["delta"]
-            b = blocks.get(idx)
-            if b is None:
-                continue
-            if delta["type"] == "text_delta":
-                b["text"] = b.get("text", "") + delta["text"]
-            elif delta["type"] == "input_json_delta":
-                b["_input_partial"] = b.get("_input_partial", "") + delta["partial_json"]
-            elif delta["type"] == "thinking_delta":
-                b["thinking"] = b.get("thinking", "") + delta.get("thinking", "")
-            elif delta["type"] == "signature_delta":
-                b["signature"] = (b.get("signature", "") or "") + delta.get("signature", "")
-        elif t == "content_block_stop":
-            idx = data["index"]
-            b = blocks.get(idx) or {}
-            if b.get("type") in ("tool_use", "server_tool_use"):
-                try:
-                    b["input"] = json.loads(b.pop("_input_partial", "") or "{}")
-                except json.JSONDecodeError:
-                    b["input"] = {}
-                    b.pop("_input_partial", None)
-            # web_search_tool_result / web_fetch_tool_result blocks come with
-            # their content already populated at content_block_start time
-            # (synthesized from the SDK's UserMessage) — nothing to reassemble.
-        elif t == "message_delta":
-            d = data.get("delta") or {}
-            msg["stop_reason"] = d.get("stop_reason", msg["stop_reason"])
-            msg["stop_sequence"] = d.get("stop_sequence")
-            u = data.get("usage") or {}
-            if "output_tokens" in u:
-                msg["usage"]["output_tokens"] = u["output_tokens"]
-            if "cache_creation_input_tokens" in u:
-                msg["usage"]["cache_creation_input_tokens"] = u["cache_creation_input_tokens"]
-            if "cache_read_input_tokens" in u:
-                msg["usage"]["cache_read_input_tokens"] = u["cache_read_input_tokens"]
-        # message_stop ends the iteration via stream_tool_events itself
-
-    msg["content"] = [blocks[i] for i in sorted(blocks.keys())]
-    return msg
+    return await collect_message_from_sse(
+        stream_tool_events(session, user_content, model), model
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -296,8 +225,9 @@ async def create_message(req: MessageCreateRequest):
         session = await manager.create(
             system_prompt=_system_prompt_text(req),
             model=req.model,
-            effort=req.effort,
+            effort=req.resolved_effort,
             include_thinking=req.include_thinking,
+            output_format=req.resolved_output_format,
         )
         user_content = _build_replay_prompt(req)
 
@@ -357,8 +287,9 @@ async def _handle_tool_use_request(req: MessageCreateRequest):
             model=req.model,
             tools_spec=custom_tools or None,
             hosted_sdk_tools=hosted_sdk_tools or None,
-            effort=req.effort,
+            effort=req.resolved_effort,
             include_thinking=req.include_thinking,
+            output_format=req.resolved_output_format,
         )
         # All tool-use sessions are kept alive after the response — client may
         # want to reuse the session_id from the x-conduit-session-id header for

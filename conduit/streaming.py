@@ -4,7 +4,9 @@ Two stream functions:
 
   * ``stream_anthropic_events`` / ``collect_non_streaming`` — plain chat
     (no tools). Iterates ``receive_response()`` inline under the session
-    lock. Existing behaviour, unchanged.
+    lock. The non-streaming variant folds the same SSE events into one
+    Message via ``collect_message_from_sse`` (shared with the tool path), so
+    text, citations, thinking and structured output render identically.
 
   * ``stream_tool_events`` — tool-use sessions. Uses a per-session
     background pump that drains ``receive_response()`` into a queue so
@@ -26,10 +28,8 @@ from typing import Any, AsyncIterator
 from fastapi import HTTPException
 
 from claude_agent_sdk import (
-    AssistantMessage,
     ResultMessage,
     StreamEvent,
-    TextBlock,
     UserMessage,
 )
 
@@ -265,8 +265,51 @@ def _clean_tool_use_block(content_block: dict) -> dict:
     return out
 
 
+# Delta types that belong to forwarded blocks and pass through unchanged:
+# text_delta (text), citations_delta (text, when the request carried document
+# blocks with citations enabled), input_json_delta (tool_use/server_tool_use),
+# thinking_delta + signature_delta (thinking).
+_FORWARDED_DELTAS = ("text_delta", "citations_delta", "input_json_delta",
+                     "thinking_delta", "signature_delta")
+
+
+# Name of the CLI-internal end-turn tool the Agent SDK registers when
+# `output_format` (structured output) is set. The model "calls" it with the
+# JSON document as the tool input, and the turn ends there.
+STRUCTURED_OUTPUT_TOOL = "StructuredOutput"
+
+
+def _is_structured_output_call(cb: dict) -> bool:
+    return cb.get("type") == "tool_use" and cb.get("name") == STRUCTURED_OUTPUT_TOOL
+
+
+def _structured_text_start(ev: dict, out_idx: int) -> dict:
+    """Present the StructuredOutput call as the upstream API would: a plain
+    `text` block whose text is the JSON document."""
+    return _sse("content_block_start",
+                {**ev, "index": out_idx, "content_block": {"type": "text", "text": ""}})
+
+
+def _structured_text_delta(ev: dict, out_idx: int) -> dict | None:
+    delta = ev.get("delta") or {}
+    if delta.get("type") != "input_json_delta":
+        return None
+    return _sse("content_block_delta",
+                {**ev, "index": out_idx,
+                 "delta": {"type": "text_delta", "text": delta.get("partial_json", "")}})
+
+
+def _structured_end_turn(ev: dict) -> dict:
+    """A StructuredOutput call ends the turn: upstream reports `end_turn`,
+    not `tool_use` (there is nothing for the client to resume)."""
+    delta = dict(ev.get("delta") or {})
+    if delta.get("stop_reason") == "tool_use":
+        delta["stop_reason"] = "end_turn"
+    return {**ev, "delta": delta}
+
+
 # ---------------------------------------------------------------------------
-# Plain-chat path (unchanged)
+# Plain-chat path
 # ---------------------------------------------------------------------------
 
 async def stream_anthropic_events(
@@ -279,6 +322,16 @@ async def stream_anthropic_events(
     block_map: dict[int, dict[str, Any]] = {}
     next_out_index = 0
     sent_message_start = False
+    # Structured output (output_config.format): only the StructuredOutput call
+    # is surfaced, as a JSON text block; any prose text blocks are suppressed so
+    # content[] holds exactly the JSON document, as upstream returns it.
+    structured_mode = bool(getattr(session, "output_format", None))
+    structured_seen = False
+    # In structured mode a message may end before the JSON arrives (the model
+    # answered in prose; the CLI prompts it again and the StructuredOutput
+    # call comes in a follow-up message). Hold that ending: a later
+    # message_start supersedes it, the ResultMessage flushes it.
+    held: list[dict] = []
 
     async for msg in session.client.receive_response():
         if isinstance(msg, StreamEvent):
@@ -286,30 +339,41 @@ async def stream_anthropic_events(
             etype = ev.get("type")
 
             if etype == "message_start":
+                structured_seen = False
+                held.clear()
                 if not sent_message_start:
                     yield _sse("message_start", _rewrite_message_start(ev, model))
                     sent_message_start = True
 
             elif etype == "content_block_start":
                 sdk_idx = ev.get("index", 0)
-                block_type = (ev.get("content_block") or {}).get("type")
-                if block_type == "text" or (block_type == "thinking" and session.include_thinking):
+                cb = ev.get("content_block") or {}
+                block_type = cb.get("type")
+                if _is_structured_output_call(cb):
                     out_idx = next_out_index
                     next_out_index += 1
-                    block_map[sdk_idx] = {"out_index": out_idx}
+                    block_map[sdk_idx] = {"out_index": out_idx, "type": "structured"}
+                    structured_seen = True
+                    yield _structured_text_start(ev, out_idx)
+                elif (block_type == "text" and not structured_mode) or (
+                    block_type == "thinking" and session.include_thinking
+                ):
+                    out_idx = next_out_index
+                    next_out_index += 1
+                    block_map[sdk_idx] = {"out_index": out_idx, "type": block_type}
                     yield _sse("content_block_start", {**ev, "index": out_idx})
                 else:
-                    block_map[sdk_idx] = {"out_index": None}
+                    block_map[sdk_idx] = {"out_index": None, "type": block_type}
 
             elif etype == "content_block_delta":
                 sdk_idx = ev.get("index", 0)
                 info = block_map.get(sdk_idx)
                 if info and info["out_index"] is not None:
-                    delta = ev.get("delta") or {}
-                    dtype = delta.get("type")
-                    # Forward the delta types that belong to forwarded blocks:
-                    # text_delta (text), thinking_delta + signature_delta (thinking).
-                    if dtype in ("text_delta", "thinking_delta", "signature_delta"):
+                    if info.get("type") == "structured":
+                        out = _structured_text_delta(ev, info["out_index"])
+                        if out is not None:
+                            yield out
+                    elif (ev.get("delta") or {}).get("type") in _FORWARDED_DELTAS:
                         yield _sse("content_block_delta", {**ev, "index": info["out_index"]})
 
             elif etype == "content_block_stop":
@@ -319,10 +383,18 @@ async def stream_anthropic_events(
                     yield _sse("content_block_stop", {**ev, "index": info["out_index"]})
 
             elif etype == "message_delta":
-                yield _sse("message_delta", ev)
+                out = _sse("message_delta", _structured_end_turn(ev) if structured_seen else ev)
+                if structured_mode and not structured_seen:
+                    held.append(out)
+                else:
+                    yield out
 
             elif etype == "message_stop":
-                yield _sse("message_stop", ev)
+                out = _sse("message_stop", ev)
+                if structured_mode and not structured_seen:
+                    held.append(out)
+                else:
+                    yield out
 
         elif isinstance(msg, ResultMessage):
             err = _result_error(msg)
@@ -339,8 +411,100 @@ async def stream_anthropic_events(
                     status_code=502,
                     detail={"type": "api_error", "message": _EMPTY_TURN_DETAIL},
                 )
+            # Structured mode, JSON never arrived: close the stream as it ended.
+            for out in held:
+                yield out
             session.message_count += 1
             return
+
+
+async def collect_message_from_sse(events: AsyncIterator[dict], model: str) -> dict:
+    """Fold an Anthropic SSE event stream into a single non-streaming Message.
+
+    Shared by the plain-chat and tool-use non-streaming routes so both paths
+    render content identically: text (with `citations` when the request
+    carried cited documents), thinking, tool_use / server_tool_use (input
+    JSON reassembled), hosted-tool result blocks, and structured-output JSON.
+    """
+    msg: dict = {
+        "id": f"msg_{uuid.uuid4().hex[:24]}",
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        },
+    }
+    blocks: dict[int, dict] = {}
+
+    async for sse in events:
+        data = json.loads(sse["data"])
+        t = data.get("type")
+        if t == "message_start":
+            m = data["message"]
+            msg["id"] = m.get("id", msg["id"])
+            msg["model"] = m.get("model", model)
+            u = m.get("usage") or {}
+            msg["usage"]["input_tokens"] = u.get("input_tokens", 0)
+            msg["usage"]["cache_creation_input_tokens"] = u.get("cache_creation_input_tokens", 0)
+            msg["usage"]["cache_read_input_tokens"] = u.get("cache_read_input_tokens", 0)
+        elif t == "content_block_start":
+            idx = data["index"]
+            blocks[idx] = dict(data["content_block"])
+            # Both custom tool_use and hosted server_tool_use stream their input
+            # as input_json_delta chunks that we reassemble.
+            if blocks[idx].get("type") in ("tool_use", "server_tool_use"):
+                blocks[idx].setdefault("input", {})
+                blocks[idx]["_input_partial"] = ""
+        elif t == "content_block_delta":
+            idx = data["index"]
+            delta = data["delta"]
+            b = blocks.get(idx)
+            if b is None:
+                continue
+            if delta["type"] == "text_delta":
+                b["text"] = b.get("text", "") + delta["text"]
+            elif delta["type"] == "citations_delta":
+                b.setdefault("citations", []).append(delta.get("citation"))
+            elif delta["type"] == "input_json_delta":
+                b["_input_partial"] = b.get("_input_partial", "") + delta["partial_json"]
+            elif delta["type"] == "thinking_delta":
+                b["thinking"] = b.get("thinking", "") + delta.get("thinking", "")
+            elif delta["type"] == "signature_delta":
+                b["signature"] = (b.get("signature", "") or "") + delta.get("signature", "")
+        elif t == "content_block_stop":
+            idx = data["index"]
+            b = blocks.get(idx) or {}
+            if b.get("type") in ("tool_use", "server_tool_use"):
+                try:
+                    b["input"] = json.loads(b.pop("_input_partial", "") or "{}")
+                except json.JSONDecodeError:
+                    b["input"] = {}
+                    b.pop("_input_partial", None)
+            # web_search_tool_result / web_fetch_tool_result blocks come with
+            # their content already populated at content_block_start time
+            # (synthesized from the SDK's UserMessage) — nothing to reassemble.
+        elif t == "message_delta":
+            d = data.get("delta") or {}
+            msg["stop_reason"] = d.get("stop_reason", msg["stop_reason"])
+            msg["stop_sequence"] = d.get("stop_sequence")
+            u = data.get("usage") or {}
+            if "output_tokens" in u:
+                msg["usage"]["output_tokens"] = u["output_tokens"]
+            if "cache_creation_input_tokens" in u:
+                msg["usage"]["cache_creation_input_tokens"] = u["cache_creation_input_tokens"]
+            if "cache_read_input_tokens" in u:
+                msg["usage"]["cache_read_input_tokens"] = u["cache_read_input_tokens"]
+        # message_stop ends the iteration via the stream function itself
+
+    msg["content"] = [blocks[i] for i in sorted(blocks.keys())]
+    return msg
 
 
 async def collect_non_streaming(
@@ -348,79 +512,12 @@ async def collect_non_streaming(
     user_content: str | list[dict],
     model: str,
 ) -> dict:
-    await session.client.query(_as_sdk_prompt(user_content))
-
-    message_id = f"msg_{uuid.uuid4().hex[:24]}"
-    content_blocks: list[dict] = []
-    stop_reason: str | None = None
-    saw_message_start = False
-    input_tokens = 0
-    output_tokens = 0
-    cache_creation_input_tokens = 0
-    cache_read_input_tokens = 0
-
-    async for msg in session.client.receive_response():
-        if isinstance(msg, AssistantMessage):
-            for block in msg.content:
-                if isinstance(block, TextBlock):
-                    content_blocks.append({"type": "text", "text": block.text})
-                elif session.include_thinking and type(block).__name__ == "ThinkingBlock":
-                    content_blocks.append({
-                        "type": "thinking",
-                        "thinking": getattr(block, "thinking", ""),
-                        "signature": getattr(block, "signature", ""),
-                    })
-            sdk_msg_id = getattr(msg, "message_id", None)
-            if sdk_msg_id:
-                message_id = sdk_msg_id
-        elif isinstance(msg, StreamEvent):
-            ev = msg.event
-            if ev.get("type") == "message_delta":
-                delta = ev.get("delta") or {}
-                stop_reason = delta.get("stop_reason") or stop_reason
-                usage = ev.get("usage") or {}
-                output_tokens = int(usage.get("output_tokens", output_tokens))
-                input_tokens = int(usage.get("input_tokens", input_tokens))
-                cache_creation_input_tokens = int(usage.get("cache_creation_input_tokens", cache_creation_input_tokens))
-                cache_read_input_tokens = int(usage.get("cache_read_input_tokens", cache_read_input_tokens))
-            elif ev.get("type") == "message_start":
-                saw_message_start = True
-                usage = (ev.get("message") or {}).get("usage") or {}
-                input_tokens = int(usage.get("input_tokens", input_tokens))
-                cache_creation_input_tokens = int(usage.get("cache_creation_input_tokens", cache_creation_input_tokens))
-                cache_read_input_tokens = int(usage.get("cache_read_input_tokens", cache_read_input_tokens))
-        elif isinstance(msg, ResultMessage):
-            err = _result_error(msg)
-            if err is not None:
-                raise err
-            session.message_count += 1
-            stop_reason = stop_reason or getattr(msg, "stop_reason", None) or "end_turn"
-            break
-
-    # An empty turn — no message_start, no content — means the upstream produced
-    # nothing (most often an exhausted subscription quota the SDK didn't flag as
-    # an error). Surface a 502 with a meaningful reason instead of a hollow 200.
-    if not saw_message_start and not content_blocks:
-        raise HTTPException(
-            status_code=502,
-            detail={"type": "api_error", "message": _EMPTY_TURN_DETAIL},
-        )
-
-    return {
-        "id": message_id,
-        "type": "message",
-        "role": "assistant",
-        "model": model,
-        "content": content_blocks,
-        "stop_reason": stop_reason or "end_turn",
-        "stop_sequence": None,
-        "usage": {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "cache_creation_input_tokens": cache_creation_input_tokens,
-            "cache_read_input_tokens": cache_read_input_tokens,
-        },
-    }
+    """Plain-chat non-streaming: fold the streaming path's events into one
+    Message. A failed or empty turn raises the same HTTPException the stream
+    would, so FastAPI returns a real 4xx/5xx body."""
+    return await collect_message_from_sse(
+        stream_anthropic_events(session, user_content, model), model
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -514,6 +611,12 @@ async def stream_tool_events(
     # Map tool_use_id -> hosted tool name, so when the SDK's UserMessage
     # arrives with results we can synthesize a properly-typed result block.
     hosted_tool_calls: dict[str, str] = {}
+    # Structured output (output_config.format): see stream_anthropic_events.
+    structured_mode = bool(getattr(session, "output_format", None))
+    structured_seen = False
+    # A JSON-less message ending withheld in structured mode (the CLI will
+    # prompt the model again); flushed only if the turn ends without JSON.
+    held: list[dict] = []
 
     while True:
         msg = await session.events_queue.get()
@@ -524,6 +627,8 @@ async def stream_tool_events(
                     status_code=502,
                     detail={"type": "api_error", "message": _EMPTY_TURN_DETAIL},
                 )
+            for out in held:
+                yield out
             return
         if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == "ERROR":
             session.state = SessionState.IDLE
@@ -543,11 +648,14 @@ async def stream_tool_events(
                     block_map.clear()
                     visible_tool_use_count = 0
                     last_stop_reason = None
+                    structured_seen = False
+                    held.clear()  # the follow-up message supersedes the held ending
                 else:
                     block_map.clear()
                     next_out_index = 0
                     visible_tool_use_count = 0
                     last_stop_reason = None
+                    structured_seen = False
                     produced_output = True
                     yield _sse("message_start", _rewrite_message_start(ev, model))
 
@@ -557,7 +665,19 @@ async def stream_tool_events(
                 block_type = cb.get("type")
                 name = cb.get("name", "")
 
-                if block_type == "text" or (block_type == "thinking" and session.include_thinking):
+                if _is_structured_output_call(cb):
+                    # CLI-internal end-turn tool carrying the structured-output
+                    # JSON. Surface it as a text block; it is not a client pause,
+                    # so it doesn't count toward visible_tool_use_count.
+                    out_idx = next_out_index
+                    next_out_index += 1
+                    block_map[sdk_idx] = {"out_index": out_idx, "type": "structured"}
+                    structured_seen = True
+                    yield _structured_text_start(ev, out_idx)
+
+                elif (block_type == "text" and not structured_mode) or (
+                    block_type == "thinking" and session.include_thinking
+                ):
                     out_idx = next_out_index
                     next_out_index += 1
                     block_map[sdk_idx] = {"out_index": out_idx, "type": block_type}
@@ -605,11 +725,11 @@ async def stream_tool_events(
                 info = block_map.get(sdk_idx) or {}
                 if info.get("out_index") is None:
                     continue
-                delta = ev.get("delta") or {}
-                dtype = delta.get("type")
-                # text_delta (text), input_json_delta (tool_use/server_tool_use),
-                # thinking_delta + signature_delta (thinking).
-                if dtype in ("text_delta", "input_json_delta", "thinking_delta", "signature_delta"):
+                if info.get("type") == "structured":
+                    out = _structured_text_delta(ev, info["out_index"])
+                    if out is not None:
+                        yield out
+                elif (ev.get("delta") or {}).get("type") in _FORWARDED_DELTAS:
                     yield _sse("content_block_delta", {**ev, "index": info["out_index"]})
 
             elif etype == "content_block_stop":
@@ -619,17 +739,26 @@ async def stream_tool_events(
                     yield _sse("content_block_stop", {**ev, "index": info["out_index"]})
 
             elif etype == "message_delta":
+                if structured_seen:
+                    ev = _structured_end_turn(ev)
                 last_stop_reason = (ev.get("delta") or {}).get("stop_reason")
                 if last_stop_reason == "tool_use" and visible_tool_use_count == 0:
                     # Hosted-only pause — suppress this signal; SDK continues internally.
                     in_hidden_hosted_pause = True
+                elif structured_mode and not structured_seen and last_stop_reason != "tool_use":
+                    # Structured mode but no JSON yet: the CLI prompts the model
+                    # again in a follow-up message. Treat this ending like a
+                    # hidden pause, but keep it in case the turn ends here.
+                    in_hidden_hosted_pause = True
+                    held = [_sse("message_delta", ev)]
                 else:
                     yield _sse("message_delta", ev)
 
             elif etype == "message_stop":
                 if in_hidden_hosted_pause:
                     # Paired with the suppressed message_delta; don't emit, don't exit.
-                    pass
+                    if held:
+                        held.append(_sse("message_stop", ev))
                 else:
                     yield _sse("message_stop", ev)
                     if last_stop_reason == "tool_use":
@@ -652,6 +781,8 @@ async def stream_tool_events(
                     status_code=502,
                     detail={"type": "api_error", "message": _EMPTY_TURN_DETAIL},
                 )
+            for out in held:  # structured mode, JSON never arrived
+                yield out
             session.message_count += 1
             session.state = SessionState.IDLE
             return

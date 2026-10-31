@@ -73,6 +73,10 @@ class Session:
     model: str | None = None
     effort: str | None = None
     include_thinking: bool = False
+    # Structured output: Anthropic `output_config.format`, forwarded as the SDK's
+    # `output_format`. When set, the streaming layer rewrites the CLI's
+    # StructuredOutput tool call into a single JSON `text` block.
+    output_format: dict[str, Any] | None = None
 
     # --- Tool-use extensions (None / empty when not a tool session) ---
     tools_spec: list[dict[str, Any]] | None = None
@@ -203,6 +207,7 @@ class SessionManager:
         hosted_sdk_tools: list[str] | None = None,
         effort: str | None = None,
         include_thinking: bool = False,
+        output_format: dict[str, Any] | None = None,
     ) -> Session:
         """Create a new session.
 
@@ -213,6 +218,8 @@ class SessionManager:
         Either or both triggers the pump-based streaming path.
 
         `effort` (low/medium/high/xhigh/max) maps to ClaudeAgentOptions.effort.
+        `output_format` ({"type": "json_schema", "schema": {...}}) maps to
+        ClaudeAgentOptions.output_format (structured output).
         """
         s = settings()
         chosen_model = model or s.default_model
@@ -223,6 +230,7 @@ class SessionManager:
         sess = Session(id=sid, client=None, model=chosen_model)
         sess.effort = chosen_effort
         sess.include_thinking = bool(include_thinking)
+        sess.output_format = output_format or None
 
         has_custom = bool(tools_spec)
         has_hosted = bool(hosted_sdk_tools)
@@ -253,6 +261,7 @@ class SessionManager:
                 include_partial_messages=True,
                 permission_mode="bypassPermissions",
                 effort=chosen_effort,
+                output_format=output_format or None,
             )
             sess.events_queue = asyncio.Queue()
         else:
@@ -262,6 +271,7 @@ class SessionManager:
                 model=chosen_model,
                 include_partial_messages=True,
                 effort=chosen_effort,
+                output_format=output_format or None,
             )
 
         client = ClaudeSDKClient(options=opts)

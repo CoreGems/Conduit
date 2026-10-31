@@ -32,7 +32,11 @@ front of it so:
 | GET    | `/health`            | Liveness                                         |
 | GET    | `/docs`              | Swagger UI — free testing console                |
 
-`session_id` is the only Conduit extension to the Anthropic schema:
+`session_id` is the main Conduit extension to the Anthropic schema (the
+others, `effort` and `include_thinking`, are covered in
+`EFFORT_INTEGRATION.md` and `THINKING_INTEGRATION.md`; standard `document`
+blocks, citations and `output_config` work as upstream, see
+`RAG_INTEGRATION.md`):
 
 - **Omitted** → behaves like Anthropic: stateless, an ephemeral session is
   created for the request and torn down afterward.
@@ -193,9 +197,10 @@ conda run -n conduit python -m pytest -m integration
   with model X, all subsequent turns through that session use X regardless of
   the `model` field the client sends. The response echoes the session's
   actual model.
-- **`thinking` blocks are filtered.** The Agent SDK may emit extended-thinking
-  content; Conduit strips those events from the SSE stream so callers see a
-  pure chat stream. Text block indices are renumbered to stay contiguous.
+- **`thinking` blocks are filtered by default.** The Agent SDK may emit
+  extended-thinking content; Conduit strips those events from the SSE stream so
+  callers see a pure chat stream (send `include_thinking: true` to receive
+  them). Text block indices are renumbered to stay contiguous.
 - **Budget after 2026-06-15.** Agent SDK usage will draw from a separate
   monthly Pro/Max credit pool, not the main Claude Code subscription.
 

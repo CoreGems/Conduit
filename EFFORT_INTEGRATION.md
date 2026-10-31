@@ -21,6 +21,8 @@ POST /v1/messages
 |---|---|---|---|---|
 | `effort` | `"low" \| "medium" \| "high" \| "xhigh" \| "max"` | ❌ | server's `CONDUIT_DEFAULT_EFFORT`, or `null` if unset (SDK default) | **Conduit extension** — not in the upstream Anthropic API. **Bound at session creation**, same as `model`. |
 
+> **Canonical spelling also accepted:** `output_config: {"effort": "high"}`, the upstream Anthropic location. When both are present, `output_config.effort` wins. With the official SDKs this is a first-class keyword argument (`output_config={"effort": "high"}`), so `extra_body` is no longer required. Everything below applies to both spellings.
+
 ---
 
 ## 1. What it controls
@@ -131,7 +133,23 @@ print(r.json()["content"][0]["text"])
 
 ### 7.2 Official `anthropic` Python SDK
 
-`effort` is **not** in the Anthropic API, so the SDK doesn't expose it as a keyword argument. Use `extra_body` to pass it through:
+Two spellings. The **canonical** one is `output_config`, which the SDK exposes as a keyword argument:
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic(base_url="http://127.0.0.1:8765", api_key="not-used")
+
+msg = client.messages.create(
+    model="claude-sonnet-4-6",
+    max_tokens=1024,
+    output_config={"effort": "high"},   # ← standard Anthropic field
+    messages=[{"role": "user", "content": "Find the prime factorization of 851."}],
+)
+print(msg.content[0].text)
+```
+
+The Conduit top-level `effort` alias is unknown to the SDK, so if you use that spelling pass it through `extra_body`:
 
 ```python
 from anthropic import Anthropic
@@ -244,7 +262,7 @@ curl -sS -X POST http://127.0.0.1:8765/v1/messages \
 1. **Sending `effort` on a resume / stateful turn does nothing.** Effort is locked at session creation. If you need a different level, create a new session.
 2. **Don't reach for `max` reflexively.** Latency can be 10× and quota burn is real, especially after 2026-06-15 when Agent SDK usage draws from its own credit pool.
 3. **Casing matters.** Only lowercase exact values work. `"High"` fails validation.
-4. **Anthropic SDK clients must use `extra_body`.** The SDK strips unknown top-level kwargs; pass `effort` inside `extra_body={"effort": "..."}`.
+4. **Anthropic SDK clients: prefer `output_config={"effort": ...}`.** It is a real keyword argument. The top-level `effort` alias is unknown to the SDK and must go in `extra_body={"effort": "..."}`.
 5. **No effort comes back in the response.** You can record what you sent but the response shape is identical to a no-`effort` response.
 6. **`effort` is not part of the official Anthropic API.** Any code you write depending on it is Conduit-specific. If you ever switch `base_url` to `api.anthropic.com`, drop the `effort` field (and use Anthropic's native `thinking: {type: "enabled", budget_tokens: N}` if you need similar control).
 

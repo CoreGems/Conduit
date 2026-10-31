@@ -17,10 +17,12 @@ read the rest of the docs to build a working integration.
 | Content-Type for POSTs | `application/json` |
 | Streaming format | Server-Sent Events (`text/event-stream`) |
 | Conduit-specific extensions | `session_id` field, `effort` field, `include_thinking` field, `x-conduit-session-id` response header |
-| Drop-in OK | Yes — pointing the official `anthropic` SDK at the base URL works for chat *and* streaming. For Conduit-only fields like `effort` / `include_thinking`, use `extra_body={...}` |
+| Drop-in OK | Yes — pointing the official `anthropic` SDK at the base URL works for chat *and* streaming. For Conduit-only fields like `effort` / `include_thinking`, use `extra_body={...}`. `output_config`, `document` blocks and citations are standard SDK arguments and need nothing special (`client.messages.parse()` works too). |
 | Tool support | Custom tools (pause/resume) and hosted server tools (no pause). **Sequential multi-cycle** AND **parallel** tool calls both supported. See §5.6 (sequential) and §5.8 (parallel — N tool_use blocks in one message, N tool_results in one resume). |
-| Thinking budget | `effort: "low" \| "medium" \| "high" \| "xhigh" \| "max"` — Conduit extension, bound at session creation. See §4.4 and `EFFORT_INTEGRATION.md` for the deep dive. |
+| Thinking budget | `effort: "low" \| "medium" \| "high" \| "xhigh" \| "max"` — Conduit extension, bound at session creation. On Claude Fable 5.1 / Fable 5 this is the **only** thinking control: thinking is always on and there is no `budget_tokens`. See §4.4, §4.5 and `EFFORT_INTEGRATION.md` for the deep dive. |
 | Hosted server tools | `WebSearch` and `WebFetch` — declare Anthropic-style in `tools[]`, SDK executes internally. Response carries `server_tool_use` + `web_search_tool_result` / `web_fetch_tool_result` blocks alongside the final `text`, all with `stop_reason: end_turn`. **No pause/resume**. See §5.7 and `WEBSEARCH_INTEGRATION.md` / `PASSTHROUGH_INTEGRATION.md`. |
+| Document input & citations | Standard Anthropic `document` blocks (text / PDF / `content` source) on the newest user turn are forwarded verbatim. With `"citations": {"enabled": true}` the answer's `text` blocks carry `citations` arrays (`citations_delta` events when streaming). See §3.1, §3.3, §8.9 and `RAG_INTEGRATION.md`. |
+| Structured output | Standard `output_config.format` (`{"type": "json_schema", "schema": {...}}`). The response is one `text` block holding the JSON document, `stop_reason: end_turn`. Bound at session creation. `output_config.effort` is the canonical spelling of `effort`. See §2.1, §8.10 and `RAG_INTEGRATION.md`. |
 
 ---
 
@@ -56,16 +58,17 @@ The chat endpoint. Mirrors Anthropic's `/v1/messages` exactly, plus `session_id`
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `model` | string | ✅ | e.g. `"claude-fable-5"` (newest, most capable), `"claude-opus-4-8"`, `"claude-sonnet-4-6"`, `"claude-haiku-4-5-20251001"`. Passed through verbatim to the Agent SDK — any model your Claude subscription can serve is accepted. **Bound at session creation** for stateful sessions — see §4.2. |
+| `model` | string | ✅ | e.g. `"claude-fable-5-1"` (newest, most capable), `"claude-fable-5"`, `"claude-opus-4-8"`, `"claude-sonnet-4-6"`, `"claude-haiku-4-5-20251001"`. Passed through verbatim to the Agent SDK — any model your Claude subscription can serve is accepted. **Bound at session creation** for stateful sessions — see §4.2. |
 | `messages` | `MessageParam[]` | ✅ | Standard Anthropic shape (see §3). |
 | `max_tokens` | int | ✅ | Standard Anthropic. |
 | `system` | string \| `TextBlockParam[]` | ❌ | System prompt. |
 | `stream` | bool | ❌ default `false` | `true` → SSE; `false` → single JSON object. |
-| `temperature` | float | ❌ | Standard Anthropic. |
+| `temperature` | float | ❌ | Standard Anthropic. Accepted for schema parity but **not forwarded** to the Agent SDK. (Upstream, Fable 5.1 / Fable 5 / Opus 5 / Sonnet 5 reject sampling params with a 400; through Conduit it is simply a no-op.) |
 | `stop_sequences` | string[] | ❌ | Standard Anthropic. |
 | `tools` | `ToolUnionParam[]` | ❌ | Mix of custom function tools and/or hosted server tools (WebSearch/WebFetch). Conduit splits internally. See §5.2 (custom single-cycle), §5.6 (custom multi-cycle), §5.7 (hosted, no pause). |
 | `tool_choice` | object | ❌ | Accepted but **currently ignored** in Phase 2. |
-| **`effort`** | `"low" \| "medium" \| "high" \| "xhigh" \| "max"` | ❌ | **Conduit extension.** Maps to the Agent SDK's `effort` field — controls thinking budget. Bound at session creation; ignored on subsequent turns of a stateful session. |
+| **`effort`** | `"low" \| "medium" \| "high" \| "xhigh" \| "max"` | ❌ | **Conduit extension.** Maps to the Agent SDK's `effort` field — controls thinking budget. Bound at session creation; ignored on subsequent turns of a stateful session. On Claude Fable 5.1 / Fable 5 this is the **only** way to control thinking depth — see §4.5. |
+| `output_config` | object | ❌ | Standard Anthropic. `effort` (the canonical home of the effort enum; wins over the top-level alias) and `format` (`{"type": "json_schema", "schema": {...}}`, structured output: the response is one `text` block holding the JSON, `stop_reason: end_turn`). Both bound at session creation. Other members are accepted and ignored. See `RAG_INTEGRATION.md`. |
 | **`include_thinking`** | bool | ❌ default `false` | **Conduit extension.** When true, response includes `thinking` content blocks (Anthropic-canonical). The model thinks regardless; this flag only controls forwarding. Bound at session creation. See `THINKING_INTEGRATION.md`. |
 | **`session_id`** | string | ❌ | **Conduit extension.** Without it: stateless or auto-allocated. With it: continue an existing session. See §4. |
 
@@ -157,6 +160,7 @@ See §1.2.
 | `"tool_use"` | `"id": str`, `"name": str`, `"input": obj` | Assistant only (server emits these) |
 | `"tool_result"` | `"tool_use_id": str`, `"content": str OR ContentBlock[]` | **User only** (you send these on resume) |
 | `"image"` | `"source": {"type": "base64", "media_type": str, "data": str}` | User. Supported on the **newest** user turn (alongside text); images in earlier history turns are dropped during stateless replay |
+| `"document"` | `"source"`: `{"type": "text", "media_type": "text/plain", "data": str}` \| `{"type": "base64", "media_type": "application/pdf", "data": str}` \| `{"type": "content", "content": [TextBlock, ...]}`; optional `"title"`, `"context"`, `"citations": {"enabled": true}` | User. Forwarded verbatim on the **newest** user turn. With citations enabled, the answer's `text` blocks carry `citations` arrays (`citations_delta` events when streaming). Documents in earlier history turns are dropped during stateless replay. See `RAG_INTEGRATION.md`. |
 
 ### 3.2 Tool declarations (entries in `tools`)
 
@@ -201,6 +205,29 @@ Custom-tool names are **bare** on both directions of the wire. The server's inte
 
 See §2.1. `content` is an ordered array of blocks — typically `[text]` for plain chat, `[text?, tool_use]` for a tool-using turn.
 
+Two shapes worth knowing:
+
+- **Cited answer** (request carried `document` blocks with `citations` enabled): the answer is split into several `text` blocks. A block that cites carries a `citations` array; a plain block has no `citations` key.
+
+  ```json
+  "content": [
+    {"type": "text", "text": "The CFO is Priya Natarajan.",
+     "citations": [{"type": "char_location", "cited_text": "The CFO is Priya Natarajan. ",
+                    "document_index": 0, "document_title": "Memo Q3",
+                    "start_char_index": 46, "end_char_index": 74}]},
+    {"type": "text", "text": " The memo does not mention a warehouse."}
+  ]
+  ```
+
+  `document_index` counts document blocks only, in the order you sent them. Location fields depend on the document source: `char_location` (text), `page_location` (PDF, 1-based pages), `content_block_location` (`content` source).
+
+- **Structured output** (`output_config.format` set): exactly one `text` block whose `text` is the JSON document, `stop_reason: "end_turn"`. Prose the model wrote alongside is dropped; `thinking` blocks still appear when `include_thinking` is on.
+
+  ```json
+  "content": [{"type": "text", "text": "{\"name\": \"Marcus Chen\", \"age\": 34}"}],
+  "stop_reason": "end_turn"
+  ```
+
 ### 3.4 SSE event sequence
 
 When `stream=true`, the response body is a sequence of SSE events in this order. **Every event has both `event:` and `data:` lines.** The `data:` value is a JSON object.
@@ -229,6 +256,23 @@ data: {"type":"message_stop"}
 ```
 
 After `message_stop` the connection closes.
+
+**Cited answer** (documents with citations enabled) — a cited `text` block announces itself with an empty `citations` list and interleaves `citations_delta` with `text_delta`. Accumulate `delta.citation` per block index exactly like text:
+```
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":"","citations":[]}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"citations_delta","citation":{"type":"char_location","cited_text":"...","document_index":0,"document_title":"Memo Q3","start_char_index":46,"end_char_index":74}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"The CFO is Priya Natarajan."}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+```
+
+**Structured output turn** (`output_config.format` set) looks exactly like a plain chat turn: one `text` block whose `text_delta`s concatenate to the JSON document, then `message_delta` with `stop_reason: "end_turn"`.
 
 **Tool-use turn (pause):**
 ```
@@ -350,7 +394,31 @@ Three fields/headers Conduit adds on top of the Anthropic wire format. All optio
 
 Defaults are sourced from the server's env (`CONDUIT_DEFAULT_MODEL`, `CONDUIT_DEFAULT_EFFORT`) if you omit a field. If the env var is also unset, the SDK's own defaults apply.
 
+The upstream-canonical spelling of effort is `output_config.effort`, which Conduit also accepts and prefers when both are present. With the official SDKs that is a plain `output_config={"effort": "high"}` keyword argument, no `extra_body` needed. `output_config.format` (structured output) rides along the same way. Both bind at session creation, like `effort`. See `RAG_INTEGRATION.md`.
+
 For the deep dive on `effort` — values, latency/cost expectations, code recipes for each language — see **`EFFORT_INTEGRATION.md`**.
+
+### 4.5 Thinking levels on Claude Fable 5.1 (and Fable 5)
+
+Short answer: **yes, and the knob is `effort`.** There is no separate "thinking level" parameter on these models — thinking is always on, and `effort` sets how deep it goes.
+
+Upstream rules for `claude-fable-5-1` / `claude-fable-5` (Anthropic API facts, not Conduit choices) and how they map onto Conduit's wire format:
+
+| Upstream field | Fable 5.1 / Fable 5 behaviour | What to send through Conduit |
+|---|---|---|
+| `output_config.effort` | `"low"` \| `"medium"` \| `"high"` \| `"xhigh"` \| `"max"`. Upstream default `high`. The **only** depth control. | Conduit's top-level `effort` field (§4.4). Same five values, forwarded to the Agent SDK's `effort` option. |
+| `thinking: {type: "adaptive"}` | Accepted; identical to omitting `thinking`. | Nothing — this is what you get by default. |
+| `thinking: {type: "enabled", budget_tokens: N}` | **400.** `budget_tokens` is removed; there is no fixed thinking budget on these models. | Don't. Conduit's request schema has no `thinking` field, so it is silently dropped (pitfall 23). Use `effort` instead. |
+| `thinking: {type: "disabled"}` | **400.** Thinking cannot be turned off. | Don't. Use `effort: "low"` for the cheapest / fastest turn. |
+| `thinking.display` (`"omitted"` default, `"summarized"`, `"updates"` beta) | Controls whether thinking *text* is returned, not whether thinking happens. The raw chain of thought is never returned on any model. | Not exposed. `include_thinking` (§4.4) is Conduit's forwarding switch; what text the SDK puts inside those blocks is the SDK's call. Because the upstream default on Fable 5.1 is `omitted`, `include_thinking: true` may yield `thinking` blocks with an empty `thinking` string — treat thinking text as best-effort on this model. |
+| `temperature` / `top_p` / `top_k` | **400** — sampling params removed. | Conduit accepts `temperature` for schema parity and never forwards it, so no error either way. |
+
+Practical guidance:
+
+- **Pick `effort` per task, not per model.** `high` is the upstream API default and a good general setting (when you omit `effort` through Conduit, the Agent SDK's own default applies — `EFFORT_INTEGRATION.md` §3). `xhigh` is the sweet spot for coding and agentic tool loops. `max` only when correctness matters more than cost. `low` / `medium` for routine transformation, classification, or sub-agent work — on Fable-class models lower effort often still matches or beats `xhigh` on older models.
+- **Expect long turns at high effort.** A single Fable 5.1 request on a hard task can run for many minutes. Use `stream: true` and generous client timeouts; the `timeout=60` in the recipes below is too tight for `xhigh` / `max` on this model.
+- **`effort` is still bound at session creation** (§4.2, §4.4). Upstream Fable 5.1 can change effort mid-conversation via a per-message `output_config` (beta `mid-conversation-output-config-2026-07-01`), but Conduit does not expose that yet — create a new session to change effort. Tracked in §11.
+- **Your integration code doesn't branch on model.** `effort` is the same client-side field for every model Conduit serves. The only Fable-specific fact is that the other upstream thinking knobs don't exist, so there is nothing else to send.
 
 ---
 
@@ -698,10 +766,13 @@ The protocol is the Anthropic protocol — these are implementation limits, not 
 3. **`tool_choice` ignored.** You can send it; it doesn't constrain the model.
 4. **Per-session model lock** — see §4.2.
 5. **Session timeout** is 30 min default. If your tool execution takes longer than that, the resume request will 404. Move long-running work to async background and respond fast to Conduit.
-6. **Thinking blocks filtered.** If you specifically need extended-thinking output, it's stripped from the stream.
+6. **Thinking blocks filtered by default.** Send `include_thinking: true` (bound at session creation) to receive `thinking` blocks; see `THINKING_INTEGRATION.md`.
 7. **Hosted-tool `allowed_domains` / `blocked_domains` / `max_uses` not yet wired through.** Conduit accepts them on the request (schema validation passes) but doesn't propagate them to the SDK. The SDK uses its own defaults.
 8. **Hosted-only sessions ARE reusable now** (was previously a limitation). The `x-conduit-session-id` header from a hosted-tool response can be reused on follow-up turns to maintain conversation context — same Pattern B behavior as plain chat.
 9. **WebFetch doesn't render JavaScript.** Server-side fetch only — modern SPAs may return thin content.
+10. **Documents only on the newest user turn (stateless).** Same rule as images: `document` blocks in earlier `messages` entries are dropped during stateless replay. In a stateful session (`session_id`) earlier documents stay in the server-side history.
+11. **Structured output suppresses prose.** With `output_config.format` set, `content[]` holds exactly one `text` block (the JSON document). Prose the model writes alongside is dropped; `thinking` blocks still appear when `include_thinking` is on. Don't combine citations with `output_config.format` (upstream rejects the pair with a 400; through Conduit the result is undefined).
+12. **`output_config` is bound at session creation.** Like `effort` and `model`: on a stateful session the per-request value is ignored.
 
 ---
 
@@ -1153,6 +1224,89 @@ curl -i -sS -X POST http://127.0.0.1:8765/v1/messages \
 # Look at `x-conduit-session-id: ...` in the response headers, then post a resume.
 ```
 
+### 8.9 Documents + citations (RAG ask)
+
+Send each retrieved passage as a `document` block with citations enabled, then the question. Build footnotes from the `citations` arrays. Full details and the streaming variant: `RAG_INTEGRATION.md`.
+
+```python
+import httpx
+
+URL = "http://127.0.0.1:8765"
+
+windows = [
+    {"title": "ops-2026-03", "text": "The warehouse moved to Tallinn in March."},
+    {"title": "hr-2026-09",  "text": "Headcount is 37 as of September."},
+]
+docs = [{
+    "type": "document",
+    "source": {"type": "text", "media_type": "text/plain", "data": w["text"]},
+    "title": w["title"],
+    "citations": {"enabled": True},
+} for w in windows]
+
+r = httpx.post(f"{URL}/v1/messages", json={
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 1024,
+    "output_config": {"effort": "medium"},
+    "system": "Answer only from the provided documents.",
+    "messages": [{"role": "user",
+                  "content": docs + [{"type": "text", "text": "Where is the warehouse?"}]}],
+}, timeout=180)
+r.raise_for_status()
+
+footnotes = []
+for block in r.json()["content"]:
+    if block["type"] != "text":
+        continue
+    cites = block.get("citations") or []
+    footnotes.extend(cites)
+    marker = f"[{len(footnotes)}]" if cites else ""
+    print(block["text"] + marker, end="")
+print()
+for i, c in enumerate(footnotes, 1):
+    print(f"[{i}] {windows[c['document_index']]['title']}: {c['cited_text']!r}")
+```
+
+### 8.10 Structured output (`output_config.format`)
+
+Standard Anthropic request; the official SDK needs no `extra_body`. The response is one `text` block of JSON.
+
+```python
+import json
+from anthropic import Anthropic
+from pydantic import BaseModel
+
+client = Anthropic(base_url="http://127.0.0.1:8765", api_key="not-used")
+
+msg = client.messages.create(
+    model="claude-sonnet-4-6",
+    max_tokens=1024,
+    output_config={
+        "effort": "low",
+        "format": {"type": "json_schema", "schema": {
+            "type": "object",
+            "properties": {"headline": {"type": "string"}, "risk_score": {"type": "integer"}},
+            "required": ["headline", "risk_score"],
+            "additionalProperties": False}},
+    },
+    messages=[{"role": "user", "content": "Summarise: runway 9 months, burn rising."}],
+)
+brief = json.loads(msg.content[0].text)
+
+# Or let the SDK derive the schema and parse the result:
+class Brief(BaseModel):
+    headline: str
+    risk_score: int
+
+parsed = client.messages.parse(
+    model="claude-sonnet-4-6", max_tokens=1024, output_format=Brief,
+    messages=[{"role": "user", "content": "Summarise: runway 9 months, burn rising."}],
+)
+print(parsed.parsed_output)
+```
+
+Declaring `tools` alongside `output_config.format` works: real tool calls still pause with `stop_reason: tool_use`; the final JSON turn ends with `end_turn`.
+
 ---
 
 ## 9. Pitfalls (read before you debug)
@@ -1179,6 +1333,8 @@ curl -i -sS -X POST http://127.0.0.1:8765/v1/messages \
 20. **Hosted-only requests keep their session.** The header is emitted; the session stays alive (idle-evicted after 30 min by default). Reuse the id for multi-turn hosted-tool chats.
 21. **The model decides when to use hosted tools.** Declaring `web_search` is advisory. Sonnet/Haiku tend to over-use it (searching even for evergreen questions). Add a system prompt restriction if cost matters.
 22. **Multi-cycle resume reuses the same `session_id`.** Every cycle (initial, resume 1, resume 2, ...) goes to the *same* server session. Don't capture a new id from each response — the server echoes the original one. Each cycle's `tool_use_id` is unique, but `session_id` stays constant. See §5.6.
+23. **A `thinking` field in the request body is silently ignored.** Conduit's request schema has no `thinking` key (pydantic drops unknown fields), so `thinking: {"type": "enabled", "budget_tokens": 8000}` or `{"type": "disabled"}` does nothing — no error, no effect. On Claude Fable 5.1 / Fable 5 those shapes would be a 400 upstream anyway: thinking is always on and `effort` is the only depth control. See §4.5.
+24. **`output_config` is parsed, not dropped.** `output_config.effort` works and is preferred over top-level `effort`; `output_config.format` turns on structured output (one JSON `text` block, `stop_reason: end_turn`). A malformed `format` (a `type` other than `json_schema`, or no `schema` object) is a 422. Unknown members such as `task_budget` are accepted and ignored. See `RAG_INTEGRATION.md`.
 
 ---
 
@@ -1243,6 +1399,22 @@ curl -i -sS -X POST http://127.0.0.1:8765/v1/messages \
 - **Streaming clients** get the same information as an SSE `error` event on a `200` response (the status is already sent when the failure is detected) — the Anthropic SDKs raise it as `APIStatusError`. If your stream ends abruptly with no `message_stop` *and* no `error` event, you are running a Conduit build older than this fix: the server log shows `RuntimeError: Caught handled exception, but response already started`. Upgrade.
 - If you get `502 api_error` ("empty response … no error from the upstream"), the turn produced nothing and the SDK didn't flag why — usually still quota, occasionally an interrupted turn. One backed-off retry is reasonable.
 
+### 10.14 No `citations` in the response
+- Every `document` block needs `"citations": {"enabled": true}` (upstream: all or none). Without it the documents are read but nothing is cited.
+- Stateless request? Only the **newest** user turn's documents are forwarded (§6 item 10). Resend them with the question, or use a `session_id`.
+- The question may simply not be covered by the documents; the model then answers uncited. Constrain it in `system`.
+- Streaming: check you accumulate `citations_delta` per block index, not just `text_delta`.
+
+### 10.15 Structured output: `content` is empty, or you expected prose too
+- In structured mode Conduit drops prose on purpose so `content[0].text` is always the JSON (§3.3). Put any explanation into the schema.
+- Empty `content` with `end_turn` means the model ended the turn without producing the JSON and the Agent SDK didn't retry further. Retry the request; if it persists, simplify the schema or raise `effort`.
+- An `error` event / 5xx carrying an Agent SDK error subtype means the SDK gave up after its own retries.
+
+### 10.16 `output_config` seems ignored
+- Bound at session creation (§6 item 12). On a stateful `session_id`, or on a tool-use resume, the per-request value does nothing; create a new session or pass `output_config` to `POST /v1/sessions`.
+- Malformed `format` is a 422, not silently ignored: `type` must be `json_schema` and `schema` an object.
+- Both `effort` and `output_config.effort` sent? The latter wins.
+
 ---
 
 ## 11. Versioning expectations
@@ -1251,7 +1423,7 @@ Conduit is pre-1.0 and tracks the Anthropic API loosely:
 
 - New Anthropic content-block types: forwarded if they pass through the SDK's `StreamEvent.event` dict.
 - Renamed/restructured Anthropic fields: server-side schema (re-exported from the `anthropic` Python package) updates with that package's version.
-- Future work: `tool_choice` enforcement, `CONDUIT_TOOL_RESULT_TIMEOUT_S` enforcement, hosted-tool `allowed_domains`/`blocked_domains` propagation, persistent (Redis/SQLite) session store.
+- Future work: `tool_choice` enforcement, `CONDUIT_TOOL_RESULT_TIMEOUT_S` enforcement, hosted-tool `allowed_domains`/`blocked_domains` propagation, persistent (Redis/SQLite) session store, per-turn `effort` changes on an existing session (upstream Fable 5.1 / Opus 5 support this via a mid-conversation `output_config` system message, beta `mid-conversation-output-config-2026-07-01`; Conduit still binds `effort` at session creation).
 
 ---
 
